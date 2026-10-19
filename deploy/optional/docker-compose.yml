@@ -1,0 +1,19 @@
+# UNVERIFIED OPTIONAL ALTERNATIVE — local Neo4j 5 Community via Docker.
+# The verified cloud backend for this project is Neo4j AuraDB Free (neo4j+s://... in .env).
+# This compose file is provided only as an optional local alternative and is NOT verified here.
+services:
+  neo4j:
+    image: neo4j:5-community
+    container_name: agent-repo-neo4j
+    ports:
+      - "7474:7474"   # Neo4j Browser
+      - "7687:7687"   # Bolt
+    environment:
+      # Password comes from your shell / .env, never from this file.
+      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}"
+    volumes:
+      - neo4j_data:/data
+
+volumes:
+  neo4j_data:
+

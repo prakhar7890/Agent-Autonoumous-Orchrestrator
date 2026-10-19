@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-repo"
+version = "0.1.0"
+description = "Versioned, graph-backed repository of multimodal agents with an autonomous router (prototype)."
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.7,<3",
+    "python-dotenv>=1.0",
+    "neo4j>=5.20,<6",
+    "langgraph>=0.2",
+    "langchain-core>=0.3",
+]
+
+[project.scripts]
+agent-repo = "agent_repo.cli:main"
+
+[project.optional-dependencies]
+providers = [
+    "langchain-openai>=0.2",
+    "langchain-groq>=0.2",
+    "langchain-google-genai>=2.0",
+]
+dev = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+include = ["agent_repo*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "neo4j: test instance runs against the Neo4j backend param (excluded with -m 'not neo4j')",
+    "neo4j_smoke: fast smoke subset covering core graph, versioning and subgraph behaviour on Neo4j/AuraDB",
+]
+
