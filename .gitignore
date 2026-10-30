@@ -8,4 +8,10 @@ build/
 dist/
 graph.json
 *.graph.json
+agent-graph.json
+agent-graph*.json
+*-graph.json
+scratch/
+cleanroom_repo/
+scratch_cleanroom/
 

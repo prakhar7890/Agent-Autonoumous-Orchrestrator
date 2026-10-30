@@ -26,11 +26,15 @@ if TYPE_CHECKING:
 MAINTAINER = "alice"
 _OWNED_LABELS = NODE_LABELS | {"GraphNode"}
 _PRINTED_WIPE_HOSTS: set[str] = set()
+# Tests must never depend on the developer's real salt; use a fixed test-only value.
+_TEST_SALT = "test-salt-0123456789abcdef0123456789abcdef"
 
 
 def _env() -> dict[str, str]:
     """Load NEO4J_URI/USER/PASSWORD from .env, overlaid with os.environ.
     NEO4J_TEST_WIPE is stripped from .env so it is strictly a shell-only variable.
+    A missing or placeholder (``change-me…``) AGENT_REPO_HASH_SALT is replaced with a
+    fixed test salt so tests do not depend on the developer's .env.
     """
     file_values = {
         k: v for k, v in dotenv_values(Path(".env")).items()
@@ -39,7 +43,30 @@ def _env() -> dict[str, str]:
     env = {**file_values, **os.environ}
     if "NEO4J_TEST_WIPE" not in os.environ:
         env.pop("NEO4J_TEST_WIPE", None)
+    salt = env.get("AGENT_REPO_HASH_SALT", "")
+    if not salt or salt.strip().lower().startswith("change-me"):
+        env["AGENT_REPO_HASH_SALT"] = _TEST_SALT
     return env
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _default_test_salt() -> Iterator[None]:
+    """Expose a test salt in os.environ when none is set, so code paths that call
+    ``Settings.from_env()`` (e.g. ``cli.main``) never fail on the .env placeholder.
+    Tests that need a specific salt still override it themselves.
+    """
+    current = os.environ.get("AGENT_REPO_HASH_SALT", "")
+    if current and not current.strip().lower().startswith("change-me"):
+        yield
+        return
+    os.environ["AGENT_REPO_HASH_SALT"] = _TEST_SALT
+    try:
+        yield
+    finally:
+        if current:
+            os.environ["AGENT_REPO_HASH_SALT"] = current
+        else:
+            os.environ.pop("AGENT_REPO_HASH_SALT", None)
 
 
 def wipe_neo4j_for_tests(store: Neo4jGraph, shell_env: Mapping[str, str]) -> None:

@@ -1,0 +1,28 @@
+{
+  "name": "agent-autonomous-orcrastrator",
+  "version": "1.0.0",
+  "description": "A **versioned, graph-backed repository of multimodal agents** plus an **autonomous router and execution engine**. The router selects agents from the *facts of a request* (what was attached and what the words mean) and each agent's *stored metadata*, explains why, executes with explicit breakpoints, remembers successful workflows per query type, and improves agents only under human control.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/prakhar7890/Agent-Autonoumous-Orchrestrator.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/prakhar7890/Agent-Autonoumous-Orchrestrator/issues"
+  },
+  "homepage": "https://github.com/prakhar7890/Agent-Autonoumous-Orchrestrator#readme",
+  "devDependencies": {
+    "@playwright/test": "^1.64.1"
+  }
+}

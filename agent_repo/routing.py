@@ -78,6 +78,14 @@ MODALITY_VOCABULARY: Mapping[Modality, frozenset[str]] = {
     Modality.JSON: frozenset({"json"}),
 }
 
+# Canonical modality token for every word in MODALITY_VOCABULARY, applied symmetrically
+# to both query terms and agent metadata terms during tokenisation.
+_MODALITY_CANONICAL: Mapping[str, str] = {
+    word: mod.value
+    for mod, words in MODALITY_VOCABULARY.items()
+    for word in words
+}
+
 _STOPWORDS = frozenset(
     "a an and are as at be by can could do for from give has have how i in into is it its me my "
     "of on or our please some that the their them then this to up us want was we what with would you your".split()
@@ -86,9 +94,12 @@ _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
 def _stem(word: str) -> str:
-    """Lightweight deterministic suffix stemmer so inflections ('summarize'/'summarizer', 'classify'/'classification') share a root."""
+    """Lightweight deterministic suffix stemmer and symmetric modality-word normaliser."""
+    if word in _MODALITY_CANONICAL:
+        return _MODALITY_CANONICAL[word]
     if len(word) <= 4:
         return word
+    stemmed = word
     for suffix, repl in (
         ("ization", "ize"), ("isation", "ize"), ("izing", "ize"), ("ising", "ize"),
         ("izer", "ize"), ("iser", "ize"), ("izes", "ize"), ("ises", "ize"),
@@ -107,16 +118,18 @@ def _stem(word: str) -> str:
         ("illustrations", "illustration"), ("statistics", "statistic"), ("stats", "statistic"),
     ):
         if word.endswith(suffix) and len(word) - len(suffix) + len(repl) >= 3:
-            return word[: -len(suffix)] + repl
-    if word.endswith("ing") and len(word) > 5:
-        return word[:-3]
-    if word.endswith("ed") and len(word) > 4:
-        return word[:-2]
-    if word.endswith("es") and len(word) > 4:
-        return word[:-2]
-    if word.endswith("s") and not word.endswith("ss") and len(word) > 3:
-        return word[:-1]
-    return word
+            stemmed = word[: -len(suffix)] + repl
+            break
+    else:
+        if word.endswith("ing") and len(word) > 5:
+            stemmed = word[:-3]
+        elif word.endswith("ed") and len(word) > 4:
+            stemmed = word[:-2]
+        elif word.endswith("es") and len(word) > 4:
+            stemmed = word[:-2]
+        elif word.endswith("s") and not word.endswith("ss") and len(word) > 3:
+            stemmed = word[:-1]
+    return _MODALITY_CANONICAL.get(stemmed, stemmed)
 
 
 def tokenize(text: str) -> list[str]:
@@ -176,7 +189,9 @@ class PlanStep(BaseModel):
     reason: str
     how_it_helps: str
     matched_terms: list[str] = Field(default_factory=list)
-    score: float = 0.0
+    # Routing score for the goal step, or None when no structured score was recorded (e.g. a
+    # reused workflow whose stored plan predates score capture). Never a fabricated default.
+    score: float | None = None
     input_modality: Modality
     output_modality: Modality
     tools: list[str] = Field(default_factory=list)
@@ -304,6 +319,32 @@ class Router:
                 out.append(rec)
         return out
 
+    def validate_plan(self, plan: Plan) -> None:
+        """Recheck a plan snapshot before persistence or execution."""
+        if not plan.steps:
+            raise ValueError("plan must contain at least one step")
+        if plan.steps[-1].agent != plan.goal_agent or plan.steps[-1].version != plan.goal_version:
+            raise ValueError("plan goal does not match its final step")
+        seen: set[tuple[str, str]] = set()
+        current = plan.payload_modality
+        for expected_order, step in enumerate(plan.steps):
+            if step.order != expected_order:
+                raise ValueError("plan steps must have contiguous order")
+            key = (step.agent, step.version)
+            if key in seen:
+                raise ValueError("plan contains a repeated agent version")
+            seen.add(key)
+            rec = self.repo.verify_version_integrity(step.agent, step.version)
+            if rec.status is not Status.STABLE:
+                raise ValueError(f"plan references non-stable version {step.agent}@{step.version}")
+            if step.input_modality is not current:
+                raise ValueError(f"step {step.order} input modality does not match previous output")
+            if step.input_modality not in rec.manifest.input_modalities:
+                raise ValueError(f"version {step.agent}@{step.version} does not accept {step.input_modality.value}")
+            if step.output_modality is not rec.manifest.output_type:
+                raise ValueError(f"step {step.order} output modality differs from the pinned manifest")
+            current = step.output_modality
+
     def score_agent(self, facts: RequestFacts, rec: AgentVersionRecord) -> tuple[float, list[str]]:
         m = rec.manifest
         q = list(facts.intent_tokens)
@@ -376,7 +417,7 @@ class Router:
                 ),
                 how_it_helps=f"{pre.manifest.usefulness} Converts '{cur_mod.value}' into '{pre.manifest.output_type.value}'.",
                 matched_terms=[],
-                score=1.0,
+                score=None,
                 input_modality=cur_mod,
                 output_modality=pre.manifest.output_type,
                 tools=tools,
@@ -438,6 +479,9 @@ class Router:
         )
         if not inc_rels:
             return None
+        # Reuse the real routing evidence recorded when the workflow was first stored, rather than
+        # fabricating a default. ``steps_json`` holds each PlanStep the router scored/prepared.
+        stored_steps = json.loads(str(wf_node.props.get("steps_json", "[]")))
         steps: list[PlanStep] = []
         cur_mod = facts.payload_modality
         for rel in inc_rels:
@@ -452,8 +496,13 @@ class Router:
                 for t in self.repo.reachable_tools(rec.agent, rec.version)
             ]
             in_mod = cur_mod if cur_mod in rec.manifest.input_modalities else rec.manifest.input_modalities[0]
+            order = int(rel.props.get("order", len(steps)))
+            stored = stored_steps[order] if 0 <= order < len(stored_steps) else {}
+            # ``score``/``matched_terms`` are copied from the stored plan. If the stored step did
+            # not record them, they stay absent (None / empty) and the API reports null.
+            raw_score = stored.get("score")
             steps.append(PlanStep(
-                order=int(rel.props.get("order", len(steps))),
+                order=order,
                 role=str(rel.props.get("role", "goal")),
                 agent=rec.agent,
                 version=rec.version,
@@ -461,8 +510,8 @@ class Router:
                 usefulness=rec.manifest.usefulness,
                 reason=str(rel.props.get("reason", "Reused from active workflow memory.")),
                 how_it_helps=rec.manifest.usefulness,
-                matched_terms=[],
-                score=1.0,
+                matched_terms=[str(t) for t in stored.get("matched_terms", [])],
+                score=float(raw_score) if raw_score is not None else None,
                 input_modality=in_mod,
                 output_modality=rec.manifest.output_type,
                 tools=tools,
@@ -498,79 +547,30 @@ class Router:
                 facts=facts,
             )
 
-        # Evaluate top candidate (and any alternative workflows).
-        primary_score, primary_matched, primary_goal = scored[0]
-        q_key = self.query_type_key(facts.payload_modality, primary_goal.agent)
-
-        # Check if primary goal needs an attachment that wasn't provided and has no chain from text.
-        reused = self.find_reusable_workflow(facts, primary_goal.agent)
-        if reused is not None:
-            wf_id, primary_steps = reused
-            first_needed = primary_steps[0].input_modality
-            if first_needed is not Modality.TEXT and not facts.has_attachment:
-                return RouteOutcome(
-                    plan=None,
-                    break_reason=BreakReason.MISSING_INPUT,
-                    detail=f"Agent '{primary_goal.agent}' requires a '{first_needed.value}' attachment, but none was provided.",
-                    facts=facts,
-                )
-            if facts.attachment_path and not Path(facts.attachment_path).is_file():
-                return RouteOutcome(
-                    plan=None,
-                    break_reason=BreakReason.MISSING_INPUT,
-                    detail=f"Attached file not found: {Path(facts.attachment_path).name}",
-                    facts=facts,
-                )
-            goal_step = primary_steps[-1]
-            return RouteOutcome(
-                plan=Plan(
-                    query_type_key=q_key,
-                    payload_modality=facts.payload_modality,
-                    intent_tokens=list(facts.intent_tokens),
-                    dropped_modality_words=list(facts.dropped_modality_words),
-                    goal_agent=goal_step.agent,
-                    goal_version=goal_step.version,
-                    reused_workflow_id=wf_id,
-                    steps=primary_steps,
-                    alternatives=[],
-                ),
-                facts=facts,
-            )
-
-        # Compose workflow from facts + BFS prerequisite chain for the highest-scoring goal agent
-        # (and any alternative workflows that share the top goal intent score within a small tie margin).
+        # Evaluate candidates within config.tie_break_margin of the top candidate, preferring
+        # agents that accept the payload directly or via a safe chainable prerequisite.
         top_score = scored[0][0]
-        top_candidates = [item for item in scored if top_score - item[0] <= 0.15]
+        top_candidates = [item for item in scored if top_score - item[0] <= self.config.tie_break_margin]
 
         valid_plans: list[tuple[AgentVersionRecord, list[PlanStep]]] = []
         missing_input_detail: str | None = None
 
-        for idx, (score, matched, cand) in enumerate(top_candidates):
+        for _idx, (score, matched, cand) in enumerate(top_candidates):
             chain = self._find_prerequisite_chain(facts.payload_modality, cand.manifest.input_modalities)
             if chain is None:
-                if idx == 0:
+                if missing_input_detail is None:
                     needed = "/".join(m.value for m in cand.manifest.input_modalities)
-                    return RouteOutcome(
-                        plan=None,
-                        break_reason=BreakReason.MISSING_INPUT,
-                        detail=(
-                            f"Goal agent '{cand.agent}' requires input modality '{needed}', "
-                            f"got '{facts.payload_modality.value}', and no safe chainable prerequisite converts between them."
-                        ),
-                        facts=facts,
+                    missing_input_detail = (
+                        f"Goal agent '{cand.agent}' requires input modality '{needed}', "
+                        f"got '{facts.payload_modality.value}', and no safe chainable prerequisite converts between them."
                     )
                 continue
             steps = self._build_steps(facts, chain, cand, score, matched)
             first_in = steps[0].input_modality
             if first_in is not Modality.TEXT and not facts.has_attachment:
-                if idx == 0:
-                    return RouteOutcome(
-                        plan=None,
-                        break_reason=BreakReason.MISSING_INPUT,
-                        detail=(
-                            f"Goal agent '{cand.agent}' requires a '{first_in.value}' attachment, but none was provided."
-                        ),
-                        facts=facts,
+                if missing_input_detail is None:
+                    missing_input_detail = (
+                        f"Goal agent '{cand.agent}' requires a '{first_in.value}' attachment, but none was provided."
                     )
                 continue
             if facts.attachment_path and not Path(facts.attachment_path).is_file():
@@ -591,10 +591,30 @@ class Router:
             )
 
         chosen_goal, chosen_steps = valid_plans[0]
+        q_key = self.query_type_key(facts.payload_modality, chosen_goal.agent)
+        reused = self.find_reusable_workflow(facts, chosen_goal.agent)
+        if reused is not None:
+            wf_id, reused_steps = reused
+            goal_step = reused_steps[-1]
+            return RouteOutcome(
+                plan=Plan(
+                    query_type_key=q_key,
+                    payload_modality=facts.payload_modality,
+                    intent_tokens=list(facts.intent_tokens),
+                    dropped_modality_words=list(facts.dropped_modality_words),
+                    goal_agent=goal_step.agent,
+                    goal_version=goal_step.version,
+                    reused_workflow_id=wf_id,
+                    steps=reused_steps,
+                    alternatives=[],
+                ),
+                facts=facts,
+            )
+
         alt_steps = [steps for _, steps in valid_plans[1: 1 + max_alternatives]]
         return RouteOutcome(
             plan=Plan(
-                query_type_key=self.query_type_key(facts.payload_modality, chosen_goal.agent),
+                query_type_key=q_key,
                 payload_modality=facts.payload_modality,
                 intent_tokens=list(facts.intent_tokens),
                 dropped_modality_words=list(facts.dropped_modality_words),

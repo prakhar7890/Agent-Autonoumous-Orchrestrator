@@ -11,20 +11,32 @@ dependencies = [
     "pydantic>=2.7,<3",
     "python-dotenv>=1.0",
     "neo4j>=5.20,<6",
-    "langgraph>=0.2",
+    "langgraph==1.2.15",
+    "langgraph-checkpoint==4.3.0",
     "langchain-core>=0.3",
+    "pypdf>=6,<7",
 ]
 
 [project.scripts]
 agent-repo = "agent_repo.cli:main"
 
 [project.optional-dependencies]
+# Live LLM provider adapters, pinned to the versions verified live in docs/LLM_PROVIDERS.md.
+# Install with: pip install -e ".[providers]". The base install stays offline-only (MockLLM).
 providers = [
-    "langchain-openai>=0.2",
-    "langchain-groq>=0.2",
-    "langchain-google-genai>=2.0",
+    "langchain-openai==1.7.2",
+    "langchain-groq==1.1.3",
+    "langchain-google-genai==4.4.2",
 ]
-dev = ["pytest>=8"]
+# Optional local, read-mostly FastAPI service over the repository (read-only except running
+# queries). The core package must import without any of these installed;
+# install with: pip install -e ".[ui]".
+ui = [
+    "fastapi==0.156.4",
+    "uvicorn==0.54.0",
+    "python-multipart==0.0.32",
+]
+dev = ["pytest>=8", "httpx==0.28.1"]
 
 [tool.setuptools.packages.find]
 include = ["agent_repo*"]

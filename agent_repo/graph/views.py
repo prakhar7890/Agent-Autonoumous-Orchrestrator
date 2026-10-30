@@ -123,7 +123,9 @@ def render_execution_subgraph(sub: ExecutionSubgraph) -> str:
     if sub.output_text:
         lines.append(f"  Output:     {sub.output_text}")
     if sub.escalation:
-        lines.append(f"  Escalation: reason={sub.escalation.get('reason')} | question={sub.escalation.get('clarifying_question')}")
+        esc_detail = sub.escalation.get("detail")
+        detail_part = f" | detail={esc_detail}" if esc_detail else ""
+        lines.append(f"  Escalation: reason={sub.escalation.get('reason')}{detail_part} | question={sub.escalation.get('clarifying_question')}")
     if sub.agent_request:
         lines.append(f"  Draft AgentRequest: status={sub.agent_request.get('status')} (routable={sub.agent_request.get('routable')})")
     return "\n".join(lines)

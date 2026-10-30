@@ -74,6 +74,7 @@ class AgentManifest(BaseModel):
     system_prompt: str = ""
     output_type: Modality
     output_description: str
+    output_schema: dict[str, Any] | None = None
     example_queries: list[str] = Field(default_factory=list)
     chainable: bool = False
     provider: str = "mock"
@@ -107,6 +108,25 @@ class AgentManifest(BaseModel):
         if not self.pipeline and not self.system_prompt.strip():
             raise ValueError("a manifest needs a pipeline or a system prompt")
         return self
+
+    def validate_output_data(self, data: Any) -> tuple[bool, str]:
+        """Validate the optional pinned output schema without executing model code."""
+        schema = self.output_schema
+        if schema is None:
+            return True, ""
+        if not isinstance(schema, dict):
+            return False, "output schema is not an object"
+        expected_type = schema.get("type")
+        if expected_type == "object" and not isinstance(data, dict):
+            return False, "output data must be an object"
+        if expected_type == "array" and not isinstance(data, list):
+            return False, "output data must be an array"
+        required = schema.get("required", [])
+        if isinstance(required, list) and isinstance(data, dict):
+            missing = [str(k) for k in required if k not in data]
+            if missing:
+                return False, f"output data is missing required field(s): {', '.join(missing)}"
+        return True, ""
 
     def tool_names(self) -> list[str]:
         return [s.name for s in self.pipeline if s.kind == "tool"]

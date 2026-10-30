@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import socket
 import time
+import json
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 from urllib.parse import urlparse
@@ -228,6 +229,25 @@ class Neo4jGraph:
         rows = self._write(
             f"CREATE (n:{label}:{_HELPER}) SET n = $props, n.id = $id RETURN {_NODE_RET}",
             props=props, id=self._new_id(),
+        )
+        return _node(rows[0])
+
+    def create_node_idempotent(self, label: str, identity: Mapping[str, Scalar], props: Props) -> Node:
+        """Atomically register a node by its natural identity, preserving identical content."""
+        check_label(label)
+        if not identity:
+            raise GraphError("idempotent node creation requires identity properties")
+        check_props(identity)
+        check_props(props)
+        merged = {**dict(identity), **dict(props)}
+        rows = self._write(
+            f"MERGE (n:{label}:{_HELPER} {{identity: $identity}}) "
+            "ON CREATE SET n.id = $id, n += $props "
+            "ON MATCH SET n = n "
+            f"RETURN {_NODE_RET}",
+            identity=json.dumps(dict(identity), sort_keys=True, separators=(",", ":")),
+            props=merged,
+            id=self._new_id(),
         )
         return _node(rows[0])
 

@@ -290,3 +290,33 @@ def test_cli_agents_command_on_aura_graph(
     status = cli.main(["agents"], graph_store=graph, stdout=stdout)
     assert status == 0
     assert "text_summarizer" in stdout.getvalue()
+
+
+def test_proposals_generate_accepts_llm_option(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AGENT_REPO_HASH_SALT", "cli-llm-opt-salt-long-enough")
+    graph_file = tmp_path / "llm-opt.json"
+    out = _run(["--graph-file", str(graph_file), "ask", "summarize this report: One. Two."], capsys)
+    execution_id = next(line.split(": ", 1)[1] for line in out.splitlines() if line.startswith("Execution: "))
+    for person in ("u1", "u2", "u3"):
+        _run([
+            "--graph-file", str(graph_file), "feedback", execution_id,
+            "--user-id", person, "--rating", "-1", "--comment", "Needs a tighter summary.",
+        ], capsys)
+    proposals = _run(["--graph-file", str(graph_file), "proposals"], capsys)
+    proposal_id = proposals.split(": ", 1)[0].strip()
+
+    bad_status = cli.main([
+        "--graph-file", str(graph_file), "proposals", "generate", proposal_id, "--llm", "leakyprov:leakymod"
+    ])
+    bad_captured = capsys.readouterr()
+    assert bad_status == 2
+    assert "leakyprov" not in bad_captured.err
+    assert "leakymod" not in bad_captured.err
+
+    generated = _run([
+        "--graph-file", str(graph_file), "proposals", "generate", proposal_id, "--llm", "mock:cli-mock-2"
+    ], capsys)
+    assert "Candidate version:" in generated
+

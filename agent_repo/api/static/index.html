@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent Repository UI</title>
+<link rel="stylesheet" href="/ui/static/style.css">
+</head>
+<body>
+<header class="banner" role="banner">
+  <span id="banner-target">Writing to: loading&hellip;</span>
+</header>
+<nav class="tabs" aria-label="Tabs">
+  <button class="tab" data-tab="ask" aria-selected="true">Ask</button>
+  <button class="tab" data-tab="agents">Agents</button>
+  <button class="tab" data-tab="versions">Versions</button>
+  <button class="tab" data-tab="executions">Executions</button>
+  <button class="tab" data-tab="proposals">Proposals</button>
+</nav>
+
+<section id="tab-ask" class="tabpanel" aria-hidden="false">
+  <h2>Ask</h2>
+  <p id="ask-status" class="status"></p>
+  <form id="ask-form">
+    <label for="ask-query">Query</label>
+    <textarea id="ask-query" name="query" rows="4" placeholder="e.g. summarize the key points: A. B. C."></textarea>
+    <label for="ask-attachment">Attachment (optional)</label>
+    <input type="file" id="ask-attachment" name="attachment">
+    <div id="ask-upload-limit" class="hint"></div>
+    <button type="submit" id="ask-submit">Submit</button>
+  </form>
+  <div id="ask-breakpoint" class="callout"></div>
+  <div id="ask-output"></div>
+  <p id="ask-exec-id" class="exec-id"></p>
+</section>
+
+<section id="tab-agents" class="tabpanel" aria-hidden="true">
+  <h2>Agents</h2>
+  <div id="agents-table"></div>
+  <div id="agent-detail"></div>
+</section>
+
+<section id="tab-versions" class="tabpanel" aria-hidden="true">
+  <h2>Versions</h2>
+  <label for="versions-agent">Agent</label>
+  <select id="versions-agent" name="versions-agent"></select>
+  <div id="versions-output"></div>
+</section>
+
+<section id="tab-executions" class="tabpanel" aria-hidden="true">
+  <h2>Executions</h2>
+  <div id="executions-table"></div>
+  <div id="execution-detail"></div>
+</section>
+
+<section id="tab-proposals" class="tabpanel" aria-hidden="true">
+  <h2>Proposals</h2>
+  <div id="proposals-table"></div>
+  <p class="note">Approval needs real authentication; use the CLI with a named human until that exists.</p>
+</section>
+
+<script src="/ui/static/app.js"></script>
+</body>
+</html>

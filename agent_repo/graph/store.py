@@ -17,7 +17,9 @@ from typing import Any, Protocol
 
 NODE_LABELS = frozenset({
     "Agent", "AgentVersion", "Tool", "QueryType", "Workflow", "Execution",
-    "Feedback", "Case", "Proposal", "Escalation", "AgentRequest",
+    "Feedback", "Case", "Proposal", "Escalation", "AgentRequest", "StepRun",
+    "Approval", "ArtifactReference", "ExecutionPlan", "WorkflowVersion",
+    "PromptVersion", "ToolVersion", "ModelConfigVersion",
 })
 REL_TYPES = frozenset({
     "HAS_VERSION", "SUPERSEDES", "USES_TOOL", "DELEGATES_TO", "PREFERS", "INCLUDES",
@@ -90,6 +92,7 @@ def new_id() -> str:
 
 class GraphStore(Protocol):
     def create_node(self, label: str, props: Props) -> Node: ...
+    def create_node_idempotent(self, label: str, identity: Mapping[str, Scalar], props: Props) -> Node: ...
     def get_node(self, node_id: str) -> Node | None: ...
     def find_nodes(self, label: str, match: Mapping[str, Scalar] | None = None) -> list[Node]: ...
     def set_props(self, node_id: str, props: Props) -> Node: ...
@@ -114,6 +117,19 @@ class InMemoryGraph:
         node = Node(self._new_id(), label, dict(props))
         self._nodes[node.id] = node
         return node
+
+    def create_node_idempotent(self, label: str, identity: Mapping[str, Scalar], props: Props) -> Node:
+        check_label(label)
+        if not identity:
+            raise GraphError("idempotent node creation requires identity properties")
+        existing = self.find_nodes(label, identity)
+        if existing:
+            node = existing[0]
+            merged = {**node.props, **props}
+            if any(node.props.get(k) != v for k, v in props.items() if k in node.props):
+                raise GraphError(f"idempotent registration conflicts for {label}")
+            return node if merged == node.props else self.set_props(node.id, props)
+        return self.create_node(label, {**dict(identity), **props})
 
     def get_node(self, node_id: str) -> Node | None:
         return self._nodes.get(node_id)

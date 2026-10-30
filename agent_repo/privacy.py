@@ -42,8 +42,8 @@ _RULES: list[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]]] = [
     (re.compile(r"(?i)\b(pass(?:word)?|pwd|secret|token|api[_-]?key)\b(\s*[:=]\s*|\s+is\s+)(\S+)"),
      lambda m: f"{m.group(1)}{m.group(2)}[REDACTED_SECRET]"),
     (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]{8,}"), "[REDACTED_SECRET]"),
-    # Well-known API key shapes (OpenAI, Groq, Google, AWS, GitHub, Slack).
-    (re.compile(r"\b(sk-[A-Za-z0-9_\-]{16,}|gsk_[A-Za-z0-9]{16,}|AIza[0-9A-Za-z_\-]{30,}|AKIA[0-9A-Z]{16}"
+    # Well-known API key shapes (OpenAI, Groq, Google, Hugging Face, AWS, GitHub, Slack).
+    (re.compile(r"\b(sk-[A-Za-z0-9_\-]{16,}|gsk_[A-Za-z0-9]{16,}|AIza[0-9A-Za-z_\-]{30,}|hf_[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16}"
                 r"|gh[pousr]_[A-Za-z0-9]{20,}|xox[abpr]-[A-Za-z0-9\-]{10,})\b"), "[REDACTED_API_KEY]"),
     (re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"), "[REDACTED_EMAIL]"),
     # Payment card: 13-19 digits with optional space/dash separators, Luhn-checked.

@@ -23,7 +23,7 @@ from langgraph.graph import END, StateGraph
 from agent_repo.execution.runner import (
     ExecutionResult, ExecutionTrace, Runner, TraceEvent, is_hard_stop, select_next_alternative,
 )
-from agent_repo.manifest import Modality
+from agent_repo.manifest import Modality, Status
 from agent_repo.privacy import scrub
 from agent_repo.routing import BreakReason, Plan, PlanStep, record_workflow_memory
 from agent_repo.tools import CallContext, Payload
@@ -124,6 +124,27 @@ def node_approval(
     if not decision:
         trace.log("plan_declined", by=state["ctx"].actor)
         return {"trace_events": list(trace.events), "approved": False, "next_route": "finish_declined"}
+    # The plan is a snapshot; approval/resume must revalidate every pinned version.
+    for step in plan.steps:
+        try:
+            rec = runner.repo.verify_version_integrity(step.agent, step.version)
+        except Exception as exc:  # noqa: BLE001 - convert stale plans into a safe breakpoint
+            trace.log("breakpoint_triggered", reason=BreakReason.PERMISSION_DENIED.value, detail=str(exc))
+            return {
+                "trace_events": list(trace.events),
+                "break_reason": BreakReason.PERMISSION_DENIED,
+                "break_detail": str(exc),
+                "next_route": "finish_broken",
+            }
+        if rec.status is not Status.STABLE:
+            detail = f"Pinned agent {step.agent}@{step.version} is no longer stable"
+            trace.log("breakpoint_triggered", reason=BreakReason.PERMISSION_DENIED.value, detail=detail)
+            return {
+                "trace_events": list(trace.events),
+                "break_reason": BreakReason.PERMISSION_DENIED,
+                "break_detail": detail,
+                "next_route": "finish_broken",
+            }
     return {"trace_events": list(trace.events), "approved": True, "next_route": "attempt"}
 
 
@@ -248,6 +269,7 @@ def node_learn(runner: Runner, state: EngineState) -> dict[str, Any]:
         steps_taken=state["steps_taken"],
         tokens_used=state["tokens_used"],
         elapsed_seconds=elapsed,
+        actor=state.get("actor", "user"),
     )
     return {
         "trace_events": list(trace.events),
@@ -389,6 +411,7 @@ class LangGraphEngine:
         self._approve_cb: Callable[[Plan], bool] | None = None
         self._checkpointer = MemorySaver()
         self._thread_seq = 0
+        self._terminal_results: dict[str, ExecutionResult] = {}
         self._compiled = self._build_graph(interrupt=require_approval)
 
     def _build_graph(self, interrupt: bool) -> Any:
@@ -489,11 +512,16 @@ class LangGraphEngine:
 
     def resume(self, pending: PendingApproval, approved: bool) -> ExecutionResult:
         """Resume a paused `PendingApproval` thread after the human approves or declines the plan."""
+        cached = self._terminal_results.get(pending.thread_id)
+        if cached is not None:
+            return cached
         config = {"configurable": {"thread_id": pending.thread_id}}
         self._compiled.update_state(config, {"approved": approved})
         out: EngineState = self._compiled.invoke(None, config=config)
         assert out.get("result") is not None
-        return out["result"]  # type: ignore[return-value]
+        result = out["result"]  # type: ignore[assignment]
+        self._terminal_results[pending.thread_id] = result
+        return result
 
     def mermaid_diagram(self) -> str:
         """Export the LangGraph StateGraph as a Mermaid flowchart string (spec §6, §9 M3)."""

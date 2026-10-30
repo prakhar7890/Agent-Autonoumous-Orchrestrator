@@ -3,6 +3,9 @@ and `make_llm("provider:model")` factory (spec §2, §6, §9 M3).
 
 All scripted/offline responses from `MockLLM` carry `is_mock=True` and a clear `MOCK LLM`
 label so a deterministic offline script is never mistaken for a live model call.
+
+`LangChainLLM` normalises provider `AIMessage.content` through `extract_text`, so providers that
+return structured content blocks (e.g. Gemini 3.x) still yield plain text.
 """
 
 from __future__ import annotations
@@ -110,6 +113,34 @@ class MockLLM:
         }
 
 
+def extract_text(content: Any) -> str:
+    """Normalise a LangChain `AIMessage.content` to plain text.
+
+    `content` is a plain string for most providers, but some (e.g. Gemini 3.x through
+    `langchain-google-genai`) return a **list of content blocks**: `{"type": "text", "text": "…"}`
+    dicts, sometimes with the text nested as `{"text": {"value": "…"}}`, alongside non-text blocks
+    (images, audio, a provider `signature`). Only human-readable text is kept; block metadata and
+    non-text blocks are dropped. Unknown shapes fall back to their JSON encoding so nothing is lost.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                value = block.get("text")
+                if isinstance(value, str):
+                    parts.append(value)
+                elif isinstance(value, dict) and isinstance(value.get("value"), str):
+                    parts.append(value["value"])
+        return "".join(parts)
+    return json.dumps(content)
+
+
 class LangChainLLM:
     """Adapter wrapping any LangChain `BaseChatModel` behind `LLMProvider`."""
 
@@ -136,7 +167,7 @@ class LangChainLLM:
             messages.append(SystemMessage(content=system_prompt))
         messages.append(HumanMessage(content=prompt))
         ai_msg: AIMessage = self._chat.invoke(messages)  # type: ignore[assignment]
-        content = ai_msg.content if isinstance(ai_msg.content, str) else json.dumps(ai_msg.content)
+        content = extract_text(ai_msg.content)
         tokens = max(10, (len(prompt) + len(system_prompt) + len(content)) // 4)
         return LLMResponse(
             text=content,
@@ -235,5 +266,5 @@ def make_llm(
             raise LLMError("Install 'langchain-openai' to use the openai provider") from exc
         return LangChainLLM(ChatOpenAI(model=model, api_key=api_key), "openai", model)  # type: ignore[arg-type]
 
-    raise LLMError(f"Unknown LLM provider {provider!r} in spec {spec!r}; expected mock, gemini, groq, or openai")
+    raise LLMError("Unknown LLM provider in 'provider:model'; expected mock, gemini, groq, or openai")
 

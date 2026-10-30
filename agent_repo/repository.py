@@ -157,6 +157,17 @@ class AgentRepository:
                                   p["author"], AgentManifest.from_json(p["manifest_json"]), p["content_hash"],
                                   p["created_at"], p.get("change_note", ""))
 
+    def verify_version_integrity(self, agent: str, version: str) -> AgentVersionRecord:
+        """Read and verify the canonical manifest before a lifecycle/runtime boundary."""
+        rec = self.get_version(agent, version)
+        raw = rec.manifest.canonical_json()
+        if _hash_text(raw) != rec.content_hash:
+            raise RepositoryError(f"manifest integrity check failed for {agent}@{version}")
+        stored = self.graph.find_nodes("AgentVersion", {"agent": agent, "version": version})[0]
+        if raw != stored.props.get("manifest_json"):
+            raise RepositoryError(f"manifest canonicalization mismatch for {agent}@{version}")
+        return rec
+
     def list_agents(self) -> list[str]:
         return sorted(n.props["name"] for n in self.graph.find_nodes("Agent"))
 
@@ -279,7 +290,7 @@ class AgentRepository:
 
     # ------------------------------------------------------------------ status
     def transition(self, agent: str, version: str, to: Status, actor: str, reason: str = "") -> AgentVersionRecord:
-        rec = self.get_version(agent, version)
+        rec = self.verify_version_integrity(agent, version)
         if to not in ALLOWED_TRANSITIONS[rec.status]:
             raise TransitionError(f"illegal transition {rec.status.value} -> {to.value} for {agent}@{version}")
         if to in _HUMAN_ONLY:
@@ -298,6 +309,7 @@ class AgentRepository:
         return self.transition(agent, version, Status.PENDING_APPROVAL, actor)
 
     def approve(self, agent: str, version: str, approver: str) -> AgentVersionRecord:
+        self.verify_version_integrity(agent, version)
         return self.transition(agent, version, Status.STABLE, approver)
 
     def reject(self, agent: str, version: str, actor: str, reason: str) -> AgentVersionRecord:

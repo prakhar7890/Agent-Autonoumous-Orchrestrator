@@ -22,7 +22,7 @@ from agent_repo.feedback import AutomaticCase, CaseCheck, FeedbackError, Feedbac
 from agent_repo.graph.neo4j_store import Neo4jConnectionError, Neo4jGraph
 from agent_repo.graph.store import GraphError, GraphStore, InMemoryGraph
 from agent_repo.graph.views import execution_subgraph, export_cypher, render_execution_subgraph
-from agent_repo.llm import MockLLM
+from agent_repo.llm import LLMError, LLMProvider, MockLLM, make_llm
 from agent_repo.manifest import AgentManifest, Modality
 from agent_repo.privacy import UserIdHasher, scrub
 from agent_repo.repository import AgentRepository, RepositoryError
@@ -89,22 +89,33 @@ def build_parser() -> argparse.ArgumentParser:
     _add_graph_options(case)
     case_actions = case.add_subparsers(dest="case_action", required=True)
     case_add = case_actions.add_parser("add")
+    _add_graph_options(case_add)
     case_add.add_argument("workflow_id")
     case_add.add_argument("--name", required=True)
     case_add.add_argument("--payload", required=True, help="Text payload to replay.")
     case_add.add_argument("--exact", action="append", default=[], metavar="FIELD=JSON_VALUE")
     case_add.add_argument("--must-not-contain", action="append", default=[])
     case_run = case_actions.add_parser("run")
+    _add_graph_options(case_run)
     case_run.add_argument("workflow_id")
 
     proposals = commands.add_parser("proposals", help="List proposals or generate/evaluate a rewrite.")
     _add_graph_options(proposals)
     proposal_actions = proposals.add_subparsers(dest="proposal_action")
-    proposal_actions.add_parser("list")
+    proposal_list = proposal_actions.add_parser("list")
+    _add_graph_options(proposal_list)
     generate = proposal_actions.add_parser("generate")
+    _add_graph_options(generate)
     generate.add_argument("proposal_id")
     generate.add_argument("--rewrite-json", help="Supply a scripted JSON rewrite instead of the offline default.")
+    generate.add_argument(
+        "--llm",
+        default=None,
+        metavar="PROVIDER:MODEL",
+        help="LLM provider:model spec to generate the candidate rewrite (default: offline mock).",
+    )
     evaluate = proposal_actions.add_parser("evaluate")
+    _add_graph_options(evaluate)
     evaluate.add_argument("proposal_id")
 
     approve = commands.add_parser("approve", help="Approve a proposal that passed evaluation.")
@@ -170,7 +181,7 @@ def _print(text: str, settings: Settings, out: TextIO) -> None:
     print(_safe_text(text, settings), file=out)
 
 
-def _feedback_loop(repo: AgentRepository, settings: Settings, llm: MockLLM) -> FeedbackLoop:
+def _feedback_loop(repo: AgentRepository, settings: Settings, llm: LLMProvider) -> FeedbackLoop:
     if not settings.hash_salt or len(settings.hash_salt) < 16:
         raise CLIError("Feedback requires AGENT_REPO_HASH_SALT of at least 16 characters in .env or the environment.")
     return FeedbackLoop(repo, UserIdHasher(settings.hash_salt), llm)
@@ -179,7 +190,7 @@ def _feedback_loop(repo: AgentRepository, settings: Settings, llm: MockLLM) -> F
 def _offline_llm() -> MockLLM:
     def draft_rewrite(_system_prompt: str, prompt: str) -> str:
         marker = "Current manifest: "
-        raw = prompt.rsplit(marker, 1)[-1]
+        raw = prompt.rsplit(marker, 1)[-1].splitlines()[0]
         manifest = AgentManifest.model_validate_json(raw)
         return json.dumps({
             "system_prompt": f"{manifest.system_prompt}\nCLI offline candidate rewrite.",
@@ -427,10 +438,17 @@ def _dispatch(args: argparse.Namespace, repo: AgentRepository, settings: Setting
                 _print(f"{node.id}: {node.props.get('status')}; workflow={node.props.get('workflow_id')}; "
                        f"trigger={node.props.get('trigger')}", settings, out)
         else:
-            loop = _feedback_loop(repo, settings, llm)
+            active_llm: LLMProvider = llm
+            if action == "generate" and getattr(args, "llm", None):
+                active_llm = make_llm(args.llm)
+                if isinstance(active_llm, MockLLM) and active_llm.router_fn is None:
+                    active_llm.router_fn = llm.router_fn
+            loop = _feedback_loop(repo, settings, active_llm)
             if action == "generate":
                 if args.rewrite_json is not None:
-                    llm.queue_response(args.rewrite_json)
+                    if not isinstance(active_llm, MockLLM):
+                        raise CLIError("--rewrite-json cannot be combined with a non-mock --llm provider.")
+                    active_llm.queue_response(args.rewrite_json)
                 _print(f"Candidate version: {loop.generate_candidate(args.proposal_id)}", settings, out)
             else:
                 evaluation = loop.evaluate_proposal(args.proposal_id)
@@ -478,7 +496,7 @@ def main(
         settings = Settings.from_env()
         if store is None:
             store, close_store = _make_store(settings, args.graph_file)
-        repo = AgentRepository(store, tools=builtin_registry())
+        repo = AgentRepository(store, tools=builtin_registry(tool_settings=settings.tools))
         if not repo.list_agents():
             seed_repository(repo, "CLI Seed Maintainer")
         llm = _offline_llm()
@@ -489,7 +507,7 @@ def main(
                 store.save(args.graph_file.expanduser())
         return 0
     except (CLIError, FeedbackError, RepositoryError, GraphError, NotHumanError, ValidationError,
-            ValueError, OSError, KeyError, ToolError) as exc:
+            ValueError, OSError, KeyError, ToolError, LLMError) as exc:
         print(f"Error: {_safe_text(str(exc), settings)}", file=errors)
         return 2
     except Exception as exc:  # noqa: BLE001 - CLI boundary redacts unexpected library errors.

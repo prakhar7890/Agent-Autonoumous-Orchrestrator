@@ -24,7 +24,7 @@ from agent_repo.routing import (
     HARD_STOP_REASONS, BreakReason, Plan, PlanStep, Router, record_workflow_memory,
 )
 from agent_repo.tools import (
-    CallContext, MissingInputError, Payload, PermissionDeniedError, ToolError,
+    CallContext, MissingInputError, Payload, PermissionDeniedError, ToolError, _sanitize_provider_error,
 )
 
 
@@ -167,6 +167,21 @@ def estimate_tokens(text: str | None) -> int:
     return max(10, len(text) // 4 + 12)
 
 
+def resolve_bindings(value: Any, request_text: str, current: Payload | None) -> Any:
+    """Resolve validated pipeline bindings without passing marker literals to tools."""
+    if isinstance(value, str):
+        if value == "request.text":
+            return request_text
+        if value in {"previous.text", "step.output.text"}:
+            return (current.text if current is not None else None) or ""
+        return value
+    if isinstance(value, list):
+        return [resolve_bindings(item, request_text, current) for item in value]
+    if isinstance(value, dict):
+        return {key: resolve_bindings(item, request_text, current) for key, item in value.items()}
+    return value
+
+
 class DraftAgentGenerator(Protocol):
     """Callable/LLM interface that drafts a new agent specification when `no_match` occurs."""
 
@@ -195,19 +210,25 @@ class ClarifyingMessage:
 
 
 def build_break_message(reason: BreakReason, detail: str) -> ClarifyingMessage:
-    clean_detail = scrub(detail)
+    clean_detail = _sanitize_provider_error(detail, prefix="") if reason is BreakReason.MAX_RETRIES else scrub(detail)
+    short_detail = clean_detail[:200]
+    max_retries_q = (
+        f"A tool kept failing after all retries ({short_detail}). Would you like to try a smaller input or check the tool dependency?"
+        if short_detail
+        else "A tool kept failing after all retries. Would you like to try a smaller input or check the tool dependency?"
+    )
     questions: dict[BreakReason, str] = {
         BreakReason.NO_MATCH: "Could you rephrase the task or tell me which output format (summary, classification, file stats, image) you want?",
         BreakReason.MISSING_INPUT: "Could you attach the required file (audio, image, or document) and verify the file path exists?",
         BreakReason.PERMISSION_DENIED: "This action uses a HIGH-risk tool. Can a named human provide an explicit AuthorityGrant with a reason?",
-        BreakReason.MAX_RETRIES: "A tool kept failing after all retries. Would you like to try a smaller input or check the tool dependency?",
+        BreakReason.MAX_RETRIES: max_retries_q,
         BreakReason.OUTPUT_INVALID: "An agent produced an invalid or empty output. Could you clarify the input format or expected fields?",
         BreakReason.MAX_STEPS: "The workflow exceeded the maximum step budget. Can we break this request into smaller steps?",
         BreakReason.TIMEOUT: "Execution exceeded the time limit. Would you like to retry with a shorter input or higher timeout?",
         BreakReason.TOKEN_BUDGET: "Execution exceeded the token budget. Can you provide a shorter excerpt to process?",
     }
     return ClarifyingMessage(
-        what_went_wrong=f"Execution stopped at breakpoint '{reason.value}': {clean_detail}",
+        what_went_wrong=f"Execution stopped at breakpoint '{reason.value}': {short_detail}",
         clarifying_question=questions[reason],
     )
 
@@ -243,6 +264,7 @@ class Runner:
         timer: Callable[[], float] | None = None,
         draft_generator: DraftAgentGenerator | None = None,
         token_estimator: Callable[[Payload, str], int] | None = None,
+        artifact_store: Any | None = None,
     ) -> None:
         self.repo = repo
         self.router = router or Router(repo)
@@ -251,6 +273,7 @@ class Runner:
         self._timer = timer
         self._draft_gen = draft_generator or DefaultDraftGenerator()
         self._token_estimator = token_estimator
+        self._artifact_store = artifact_store
 
     def _now_seconds(self) -> float:
         if self._timer is not None:
@@ -302,6 +325,23 @@ class Runner:
             )
 
         plan = route_out.plan
+        try:
+            self.router.validate_plan(plan)
+        except ValueError as exc:
+            trace.log("breakpoint_triggered", reason=BreakReason.NO_MATCH.value, detail=str(exc), phase="validation")
+            return self._finish_broken(
+                query=query,
+                facts_mod=route_out.facts.payload_modality if route_out.facts else (decl_mod or Modality.TEXT),
+                plan=None,
+                workflow_id=None,
+                reason=BreakReason.NO_MATCH,
+                detail=str(exc),
+                goal_agent_failed=False,
+                trace=trace,
+                steps_taken=0,
+                tokens_used=0,
+                elapsed_seconds=max(0.0, self._now_seconds() - start_time),
+            )
         trace.log(
             "plan_created",
             query_type_key=plan.query_type_key,
@@ -380,6 +420,7 @@ class Runner:
                 steps_taken=steps_taken,
                 tokens_used=tokens_used,
                 exhausted_tools=exhausted_tools,
+                request_text=query,
             )
             if ok and out_payload is not None:
                 now_iso = self._clock().isoformat()
@@ -408,6 +449,7 @@ class Runner:
                     steps_taken=steps_taken,
                     tokens_used=tokens_used,
                     elapsed_seconds=elapsed,
+                    actor=ctx.actor,
                 )
                 return ExecutionResult(
                     execution_id=exec_node,
@@ -473,6 +515,7 @@ class Runner:
         steps_taken: int,
         tokens_used: int,
         exhausted_tools: set[str],
+        request_text: str = "",
     ) -> tuple[bool, Payload | None, BreakReason | None, str, int, int, str]:
         cur = initial_payload
         for plan_step in steps:
@@ -487,6 +530,7 @@ class Runner:
                 steps_taken=steps_taken,
                 tokens_used=tokens_used,
                 exhausted_tools=exhausted_tools,
+                request_text=request_text,
             )
             if not ok:
                 return False, None, brk, detail, steps_taken, tokens_used, plan_step.role
@@ -505,8 +549,11 @@ class Runner:
         steps_taken: int,
         tokens_used: int,
         exhausted_tools: set[str],
+        request_text: str = "",
     ) -> tuple[bool, Payload | None, BreakReason | None, str, int, int]:
-        rec = self.repo.get_version(agent, version)
+        rec = self.repo.verify_version_integrity(agent, version)
+        if rec.status is not Status.STABLE:
+            return False, None, BreakReason.PERMISSION_DENIED, f"Agent {agent}@{version} is no longer stable", steps_taken, tokens_used
         trace.log("agent_started", agent=agent, version=version, role=role, input_modality=payload.modality.value)
         cur = payload
 
@@ -530,6 +577,7 @@ class Runner:
                     steps_taken=steps_taken,
                     tokens_used=tokens_used,
                     exhausted_tools=exhausted_tools,
+                    request_text=request_text,
                 )
                 if not ok:
                     return False, None, brk, detail, steps_taken, tokens_used
@@ -542,10 +590,21 @@ class Runner:
             attempt = 0
             while True:
                 attempt += 1
+                # Account for every billable attempt, including failures, before dispatch.
+                attempt_tokens = self._estimate_step_tokens(cur, pipe_step.name)
+                if tokens_used + attempt_tokens > self.limits.token_budget:
+                    detail = (
+                        f"Token budget would be exceeded before tool '{pipe_step.name}' "
+                        f"attempt {attempt} (tokens={tokens_used + attempt_tokens})."
+                    )
+                    trace.log("breakpoint_triggered", reason=BreakReason.TOKEN_BUDGET.value,
+                              tool=pipe_step.name, attempt=attempt, detail=detail)
+                    return False, None, BreakReason.TOKEN_BUDGET, detail, steps_taken, tokens_used
+                tokens_used += attempt_tokens
                 try:
                     trace.log("tool_call", tool=pipe_step.name, agent=agent, attempt=attempt)
-                    cur = self.repo.tools.call(pipe_step.name, cur, dict(pipe_step.params), ctx)
-                    tokens_used += self._estimate_step_tokens(cur, pipe_step.name)
+                    params = resolve_bindings(dict(pipe_step.params), request_text, cur)
+                    cur = self.repo.tools.call(pipe_step.name, cur, params, ctx)
                     trace.log("tool_ok", tool=pipe_step.name, attempt=attempt, tokens_used=tokens_used)
                     break
                 except PermissionDeniedError as exc:
@@ -555,11 +614,14 @@ class Runner:
                     trace.log("breakpoint_triggered", reason=BreakReason.MISSING_INPUT.value, tool=pipe_step.name, detail=str(exc))
                     return False, None, BreakReason.MISSING_INPUT, str(exc), steps_taken, tokens_used
                 except ToolError as exc:
-                    trace.log("tool_error", tool=pipe_step.name, attempt=attempt, error=str(exc))
-                    if should_retry_tool(attempt, self.limits):
+                    clean_err = _sanitize_provider_error(exc, prompt=cur.text or "", prefix="")
+                    if cur.path:
+                        clean_err = clean_err.replace(cur.path, "[REDACTED_PATH]")[:200]
+                    trace.log("tool_error", tool=pipe_step.name, attempt=attempt, error=clean_err, retryable=exc.retryable)
+                    if exc.retryable and should_retry_tool(attempt, self.limits):
                         continue
                     exhausted_tools.add(pipe_step.name)
-                    detail = f"Tool '{pipe_step.name}' failed after {attempt} attempt(s): {exc}"
+                    detail = f"Tool '{pipe_step.name}' failed after {attempt} attempt(s): {clean_err}"[:200]
                     trace.log("breakpoint_triggered", reason=BreakReason.MAX_RETRIES.value, tool=pipe_step.name, detail=detail)
                     return False, None, BreakReason.MAX_RETRIES, detail, steps_taken, tokens_used
 
@@ -571,6 +633,8 @@ class Runner:
                 return False, None, post_brk, detail, steps_taken, tokens_used
 
         valid, invalid_reason = validate_step_output(cur, rec.manifest.output_type)
+        if valid:
+            valid, invalid_reason = rec.manifest.validate_output_data(cur.data)
         if not valid:
             detail = f"Agent {agent}@{version} produced invalid output: {invalid_reason}"
             trace.log("breakpoint_triggered", reason=BreakReason.OUTPUT_INVALID.value, agent=agent, detail=detail)
@@ -591,9 +655,45 @@ class Runner:
         steps_taken: int,
         tokens_used: int,
         elapsed_seconds: float,
+        actor: str = "user",
     ) -> str:
         now_iso = self._clock().isoformat()
         q_key = plan.query_type_key if plan else "unmatched"
+
+        artifact_props: dict[str, Any] = {}
+        if output is not None and output.modality is Modality.IMAGE and output.data:
+            content = output.data.get("content")
+            if content:
+                raw_bytes = content.encode("utf-8") if isinstance(content, str) else bytes(content)
+                provider = str(output.data.get("provider", ""))
+                model = str(output.data.get("model", ""))
+                store = self._artifact_store
+                if store is None:
+                    from agent_repo.artifacts import get_default_artifact_store
+                    store = get_default_artifact_store()
+                    self._artifact_store = store
+                try:
+                    record = store.save_image(
+                        raw_bytes,
+                        execution_id="",
+                        provider=provider,
+                        model=model,
+                        owner=actor or "user",
+                        created_at=now_iso,
+                    )
+                    artifact_props = {
+                        "artifact_id": record.artifact_id,
+                        "artifact_ref": record.relative_ref,
+                        "artifact_mime": record.mime,
+                        "artifact_size": record.size_bytes,
+                        "artifact_provider": scrub(record.provider),
+                        "artifact_model": scrub(record.model),
+                        "artifact_created_at": now_iso,
+                        "artifact_owner": scrub(actor or "user"),
+                    }
+                except Exception:  # noqa: BLE001
+                    pass
+
         exec_node = self.repo.graph.create_node("Execution", {
             "query": scrub(query),
             "query_type_key": q_key,
@@ -607,6 +707,7 @@ class Runner:
             "tokens_used": tokens_used,
             "elapsed_seconds": elapsed_seconds,
             "created_at": now_iso,
+            **artifact_props,
         })
         qt_nodes = self.repo.graph.find_nodes("QueryType", {"key": q_key})
         if qt_nodes:
@@ -630,6 +731,8 @@ class Runner:
         elapsed_seconds: float,
     ) -> ExecutionResult:
         now_iso = self._clock().isoformat()
+        if reason is BreakReason.MAX_RETRIES:
+            detail = _sanitize_provider_error(detail, prompt=query, prefix="")
         msg = build_break_message(reason, detail)
         exec_id = self._record_execution_node(
             query=query,

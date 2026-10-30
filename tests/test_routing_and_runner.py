@@ -315,3 +315,27 @@ def test_runtime_breakpoints_retries_alternative_skipped_and_limits(seeded: Agen
     assert "bob@example.com" not in trace_dump and "secret123" not in trace_dump
     assert "[REDACTED_EMAIL]" in trace_dump and "[REDACTED_SECRET]" in trace_dump
 
+
+def test_symmetric_modality_word_normalisation_and_payload_compatible_margin(
+    seeded: AgentRepository,
+) -> None:
+    """Modality words normalise symmetrically between query and metadata terms, and candidates within
+    the 0.15 score margin that accept the payload (directly or via chain) are preferred over
+    incompatible candidates while keeping missing_input when no compatible candidate is within margin.
+    """
+    router = Router(seeded)
+
+    # Symmetric modality normalisation: 'paragraph' normalises to 'text', matching text_summarizer
+    r_para = router.route("pull out the main takeaway from this paragraph")
+    assert r_para.plan is not None and r_para.plan.goal_agent == "text_summarizer"
+
+    # Payload compatibility within 0.15 margin: 'text' matches both audio_transcriber (needs audio)
+    # and text_summarizer (accepts text) within 0.15; text_summarizer is chosen.
+    r_compat = router.route("what are the highlights of this text")
+    assert r_compat.plan is not None and r_compat.plan.goal_agent == "text_summarizer"
+
+    # When no payload-compatible candidate is within the 0.15 margin, missing_input is preserved.
+    r_incompat = router.route("classify this picture and label what is in the photo")
+    assert r_incompat.plan is None and r_incompat.break_reason is BreakReason.MISSING_INPUT
+
+

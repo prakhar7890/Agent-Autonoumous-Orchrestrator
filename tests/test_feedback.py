@@ -200,12 +200,67 @@ def test_candidate_rewrite_is_labelled_mock_and_changes_only_allowed_fields(feed
     assert proposal is not None and proposal.props["rewrite_label"] == "MOCK LLM: scripted rewrite"
 
 
-@pytest.mark.parametrize("raw", [
-    "not json",
-    json.dumps({"system_prompt": "rewrite", "pipeline": [], "input_modalities": ["text"]}),
-    json.dumps({"system_prompt": "rewrite", "pipeline": "text_summarize"}),
+def test_candidate_version_is_linked_from_proposal_by_proposes_edge(feedback_context) -> None:
+    repo, execution, loop = feedback_context
+    proposal_id = _proposal(repo, loop, execution.workflow_id)
+    assert repo.graph.rels(start=proposal_id, rel_type="PROPOSES") == []
+    _queue_rewrite(loop)
+    version = loop.generate_candidate(proposal_id)
+    candidate = repo.get_version("text_summarizer", version)
+    proposals = repo.graph.rels(start=proposal_id, rel_type="PROPOSES")
+    assert [rel.end for rel in proposals] == [candidate.node_id]
+    assert proposals[0].type == "PROPOSES"
+
+
+@pytest.mark.parametrize("fence", ["```json", "```"])
+def test_fenced_json_rewrite_is_accepted_and_prompt_includes_context(
+    feedback_context, fence: str
+) -> None:
+    repo, execution, loop = feedback_context
+    proposal_id = _proposal(repo, loop, execution.workflow_id)
+    fenced_payload = f"{fence}\n{REWRITE_TO_ONE_SENTENCE}\n```"
+    _queue_rewrite(loop, fenced_payload)
+    version = loop.generate_candidate(proposal_id)
+    candidate = repo.get_version("text_summarizer", version)
+    assert candidate.status is Status.CANDIDATE
+    assert repo.graph.get_node(proposal_id).props.get("rewrite_error") == ""
+    assert isinstance(loop.llm, MockLLM)
+    _sent_sys, sent_prompt = loop.llm.calls[-1]
+    assert "Current pipeline:" in sent_prompt
+    assert "Allowed tool names:" in sent_prompt
+    assert "text_summarize" in sent_prompt
+    assert "email_send" not in sent_prompt and "email_sender" not in sent_prompt
+    assert "Allowed agent names:" in sent_prompt
+    assert "audio_transcriber@0.1" in sent_prompt
+
+
+@pytest.mark.parametrize("raw,expected_reason", [
+    ("not json", "invalid JSON"),
+    ("```json\nnot valid json at all\n```", "invalid JSON"),
+    (
+        json.dumps({"system_prompt": "rewrite", "pipeline": [], "extra_key": True}),
+        "rewrite JSON must contain exactly system_prompt and pipeline",
+    ),
+    (
+        "```json\n" + json.dumps({"system_prompt": "rewrite", "pipeline": [], "extra_key": True}) + "\n```",
+        "rewrite JSON must contain exactly system_prompt and pipeline",
+    ),
+    (
+        json.dumps({"system_prompt": "rewrite", "pipeline": [], "input_modalities": ["audio"]}),
+        "rewrite JSON must contain exactly system_prompt and pipeline",
+    ),
+    (
+        json.dumps({"system_prompt": "rewrite", "pipeline": [], "output_type": "json"}),
+        "rewrite JSON must contain exactly system_prompt and pipeline",
+    ),
+    (
+        json.dumps({"system_prompt": "rewrite", "pipeline": "text_summarize"}),
+        "rewrite system_prompt must be a string and pipeline must be an array",
+    ),
 ])
-def test_invalid_rewrite_shapes_fail_safely(feedback_context, raw: str) -> None:
+def test_invalid_rewrite_shapes_fenced_garbage_extra_keys_and_modality_change_fail_safely(
+    feedback_context, raw: str, expected_reason: str
+) -> None:
     repo, execution, loop = feedback_context
     proposal_id = _proposal(repo, loop, execution.workflow_id)
     _queue_rewrite(loop, raw)
@@ -213,16 +268,21 @@ def test_invalid_rewrite_shapes_fail_safely(feedback_context, raw: str) -> None:
     with pytest.raises(FeedbackError):
         loop.generate_candidate(proposal_id)
     assert len(repo.versions("text_summarizer")) == versions_before
-    assert repo.graph.get_node(proposal_id).props.get("rewrite_error")
+    err = repo.graph.get_node(proposal_id).props.get("rewrite_error")
+    assert err == expected_reason
+    assert err != "RepositoryError"
 
 
-@pytest.mark.parametrize("pipeline", [
-    [{"kind": "tool", "name": "rm_rf"}],
-    [{"kind": "tool", "name": "email_send"}],
-    [{"kind": "agent", "name": "email_sender", "version": "0.1"}],
+@pytest.mark.parametrize("pipeline,expected_substr", [
+    ([{"kind": "tool", "name": "rm_rf"}], "unknown tool 'rm_rf'"),
+    ([{"kind": "tool", "name": "email_send"}], "non-human authors cannot add HIGH-risk tool 'email_send'"),
+    (
+        [{"kind": "agent", "name": "email_sender", "version": "0.1"}],
+        "non-human authors cannot add sub-agent email_sender@0.1: it reaches a HIGH-risk tool",
+    ),
 ])
 def test_rewrite_cannot_add_unknown_or_high_risk_tool_directly_or_transitively(
-    feedback_context, pipeline: list[dict[str, object]]
+    feedback_context, pipeline: list[dict[str, object]], expected_substr: str
 ) -> None:
     repo, execution, loop = feedback_context
     proposal_id = _proposal(repo, loop, execution.workflow_id)
@@ -231,6 +291,9 @@ def test_rewrite_cannot_add_unknown_or_high_risk_tool_directly_or_transitively(
     with pytest.raises(FeedbackError, match="rejected"):
         loop.generate_candidate(proposal_id)
     assert len(repo.versions("text_summarizer")) == versions_before
+    err = str(repo.graph.get_node(proposal_id).props.get("rewrite_error", ""))
+    assert expected_substr in err
+    assert err not in {"RepositoryError", "GuardrailError"}
 
 
 def test_eval_gate_requires_strict_accuracy_improvement_without_regression(feedback_context) -> None:
