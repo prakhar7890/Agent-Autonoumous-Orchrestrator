@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools==84.2.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,12 +8,13 @@ version = "0.1.0"
 description = "Versioned, graph-backed repository of multimodal agents with an autonomous router (prototype)."
 requires-python = ">=3.11"
 dependencies = [
-    "pydantic>=2.7,<3",
-    "python-dotenv>=1.0",
-    "neo4j>=5.20,<6",
+    "pydantic==2.14.1",
+    "python-dotenv==1.2.4",
+    "neo4j==5.28.8",
     "langgraph==1.2.15",
     "langgraph-checkpoint==4.3.0",
-    "langchain-core>=0.3",
+    "langchain-core==1.6.11",
+    "jsonschema==4.26.0",
     "pypdf>=6,<7",
 ]
 
@@ -21,25 +22,27 @@ dependencies = [
 agent-repo = "agent_repo.cli:main"
 
 [project.optional-dependencies]
-# Live LLM provider adapters, pinned to the versions verified live in docs/LLM_PROVIDERS.md.
-# Install with: pip install -e ".[providers]". The base install stays offline-only (MockLLM).
+# Free-tier Gemini adapter. Paid and unverified hosted providers are intentionally excluded.
+# Included in the root all-extras requirements lock; MockLLM remains available offline.
 providers = [
-    "langchain-openai==1.7.2",
-    "langchain-groq==1.1.3",
     "langchain-google-genai==4.4.2",
+    "google-genai==2.31.0",
 ]
 # Optional local, read-mostly FastAPI service over the repository (read-only except running
 # queries). The core package must import without any of these installed;
-# install with: pip install -e ".[ui]".
+# the root all-extras requirements lock includes these UI dependencies.
 ui = [
     "fastapi==0.156.4",
     "uvicorn==0.54.0",
     "python-multipart==0.0.32",
 ]
-dev = ["pytest>=8", "httpx==0.28.1"]
+dev = ["pytest==9.1.1", "httpx==0.28.1", "ruff==0.17.3", "setuptools==84.2.1"]
 
 [tool.setuptools.packages.find]
 include = ["agent_repo*"]
+
+[tool.setuptools.package-data]
+"agent_repo.api" = ["static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -48,4 +51,3 @@ markers = [
     "neo4j: test instance runs against the Neo4j backend param (excluded with -m 'not neo4j')",
     "neo4j_smoke: fast smoke subset covering core graph, versioning and subgraph behaviour on Neo4j/AuraDB",
 ]
-
