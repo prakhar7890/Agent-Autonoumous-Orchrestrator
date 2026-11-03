@@ -151,3 +151,429 @@ records. No external integrations were touched.
 Tests, Ruff, Neo4j, and live providers were **not run in this session**. The remaining
 repair items (schema validation, idempotent terminal persistence, clarification edge cases,
 and strict retry/budget accounting) remain **not verified**.
+
+
+## Local Ollama provider
+`OllamaLLM` and local-only configuration were added on 2026-10-30. Focused offline verification: 17 passed, 1 skipped. Live Ollama inference, full-suite rerun, lint, Neo4j persistence, and cloud providers remain not verified. Cloud dispatch is blocked unless ALLOW_CLOUD_PROVIDERS=true; no fallback is performed.
+
+## Verification update (2026-10-30)
+
+- Full offline suite: `python -m pytest -q -m "not neo4j"` => **378 passed, 1 skipped, 118 deselected**, one dependency deprecation warning.
+- Ruff: `ruff check .` was attempted; Ruff is not installed, so lint is **not verified**.
+- User-reported live adapter smoke: `make_llm("ollama:qwen3:4b")` reached the local Ollama server after `qwen3:4b` was pulled. This verifies adapter connectivity only.
+- Application-level summarization through the governed API path using an approved Ollama-pinned version is **not verified**. Current seeded `text_summarizer@0.1` remains a deterministic tool-backed historical version pinned to `mock`; it was not silently changed.
+- Cloud calls, fallback behavior, Neo4j persistence/restart, and browser/UI checks were not performed.
+
+## Ollama execution diagnosis (2026-10-30)
+
+Reproduction against `local-ollama-demo2.json` was rerun without re-registering or re-approving the version. `text_summarizer@0.2` retained checksum `52eeef855ae5b22e16d1a099308b9cfd9ba08bc8805ac09d29cff94f6059e461` and executed successfully through the CLI, producing a validated text summary. A subsequent API `POST /ask` against the same loaded graph returned HTTP 200 with status `succeeded`.
+
+The earlier `PROVIDER_ERROR` was not reproducible. Direct and application calls both use Ollama at `http://localhost:11434`, model `qwen3:4b`, context 4096, prediction 512, and thinking disabled. The first application attempt likely encountered transient local model startup/CPU latency, but no HTTP status or stable exception category was captured, so that hypothesis is not claimed as confirmed. No cloud fallback occurred.
+
+Verification in this session: `python -m pytest -q -m "not neo4j" -p no:cacheprovider` => **378 passed, 1 skipped, 118 deselected**, one dependency deprecation warning. Ruff remains not verified because it is unavailable. Browser/Playwright and Neo4j persistence checks were not performed.
+
+## Browser verification (2026-10-30)
+
+Playwright configuration/tests are not present in the repository. `package.json` declares `@playwright/test`, but the package is not installed locally. `npx playwright --version` was attempted and failed because npm is offline/cache-only (`ENOTCACHED`), so Chromium could not be installed and no browser tests were run. No screenshots or traces were generated. HTTP/API checks are not counted as browser verification.
+
+The application entry point documented by the repository is `python -m agent_repo.api --graph-file <path> --port <port>`. A deterministic browser fixture and Playwright suite remain a follow-up blocker requiring dependency installation.
+
+## Playwright setup (2026-10-30)
+
+Added `playwright.config.js` and deterministic tests in `playwright/ui.spec.js` covering navigation, versions, submission/result rendering, page errors, and responsive overflow. The suite uses the documented `python -m agent_repo.api --graph-file agent-graph.json --port 8765` entry point and retains traces/screenshots on failure.
+
+Execution was blocked before tests started: `npx playwright test --reporter=html` failed with npm `ENOTCACHED` because `@playwright/test` is not installed locally and the environment cannot access the npm registry. Therefore browser passed/failed counts are **0/0**, and no HTML report, screenshots, or traces were generated.
+
+## Playwright run update (2026-10-30)
+
+The installed browser suite initially ran: **1 passed, 1 failed**. The failure was a test defect: the Versions tab defaults to `audio_transcriber`; the test expected `text_summarizer` without selecting it. The test now explicitly selects `text_summarizer`, preserving the application behavior. The run produced a failure screenshot and trace under `test-results/`.
+
+A rerun after this fix was blocked before test startup by `Error: spawn EPERM` while Playwright attempted to launch the configured web server. No post-fix pass/fail count is claimed. The likely environment issue is child-process launch permission; no application assertion was weakened.
+
+## Durable session milestone progress (2026-10-30)
+
+Implemented initial session persistence contracts:
+
+- Added `Session`, `Request`, and `Result` graph labels plus session relationship types.
+- Added `POST /sessions`, `GET /sessions`, and `GET /sessions/{session_id}` with owner filtering.
+- `POST /ask` now creates or validates a session and links the resulting execution to that session idempotently.
+- Session and execution content is limited to sanitized graph properties; no credentials or raw diagnostics are stored.
+
+Focused API verification exposed one expected contract update: the existing exact-route test fails because the three session routes are now present (`61 passed, 1 failed, 2 setup errors`; setup errors were Windows temp-directory permission failures). UI session controls, Neo4j-specific MERGE constraints, restart durability, and Playwright session coverage remain incomplete and are not verified.
+
+## Milestone 1 session/UI continuation (2026-10-30)
+
+Implemented session UI and backend ownership behavior:
+
+- Added session bar with New session and session selector controls.
+- Browser requests carry the active session header; switching clears stale output.
+- Added session creation/list/detail routes and linked executions to sessions.
+- Updated the exact API route contract to include the intentional session routes.
+- Verified owner isolation manually with Alice/Bob: Alice can list and submit to her session; Bob receives an empty list and 404 for Alice's session.
+
+Offline API result: **62 passed, 2 setup errors** when running `tests/test_api.py`; setup errors are Windows pytest temporary-directory permission failures in artifact tests. Using `--basetemp` under the workspace produced the same access-denied cleanup error. A direct session contract smoke succeeded (`POST /sessions` 200, Alice submission 200/succeeded, Bob detail 404).
+
+Neo4j MERGE constraints, durable Request/Plan/Result/Step relationships, restart verification, and Playwright session coverage remain not verified. The current graph abstraction stores Session and execution links in memory/file; this is not evidence of Neo4j durability.
+
+## Session persistence and browser continuation (2026-10-30)
+
+Added durable graph records in the application path:
+
+- Each request creates a sanitized `Request` node linked from its `Session`.
+- Each execution links back to the request with `HAS_EXECUTION`.
+- A stored `ExecutionPlan` node records the serialized plan and links from the request and execution.
+- Session execution links remain idempotent for repeated reads.
+- The UI now supports creating/selecting sessions and sends the active session header on submissions.
+
+Offline verification: `python -m pytest -q -m "not neo4j" -p no:cacheprovider` => **378 passed, 1 skipped, 118 deselected**, one deprecation warning. A direct contract smoke confirmed one Request, one ExecutionPlan, and one HAS_EXECUTION relationship after a submission.
+
+Playwright diagnosis: with `PW_MANUAL_SERVER=1` and the documented API running separately, Playwright reached test discovery but failed before executing tests. The sanitized traceback identifies `node:internal/child_process` ? `WorkerHost.startRunner` ? `spawn EPERM` on Node v24.21.0. This is a worker-process restriction, not application startup or browser launch. No browser test count is claimed after this failure. Manual-server mode is now supported by `playwright.config.js`.
+
+Real Neo4j constraints/MERGE, restart durability, and live Ollama browser checks remain blocked/not verified. The in-memory/file graph evidence is not claimed as Neo4j durability.
+
+## Authenticated session recovery and request idempotency (2026-11-02)
+
+Implemented source changes in this milestone:
+
+- The runnable API now requires actor-specific bearer tokens from `AGENT_REPO_API_TOKENS`.
+  The API ignores caller-supplied actor headers, hashes authenticated actor identities, and
+  scopes execution/session reads to the authenticated owner. Health and static UI assets remain
+  public so the browser can load and request credentials.
+- The browser accepts the token in a password field and retains it in memory only. Selecting or
+  reloading a session restores saved output; late responses cannot overwrite a different session.
+- `POST /ask` accepts actor-scoped idempotency keys, rejects changed-content reuse, persists a
+  running request before dispatch, and stores the completed response for exact replay. File-backed
+  graph writes are flushed atomically before dispatch and after result association.
+- Neo4j and in-memory graph stores now create request nodes and session links idempotently as one
+  operation; a conflicting concurrent idempotency claim cannot attach the request to another
+  session. Neo4j adds a uniqueness constraint for request idempotency identities.
+- Added API, graph, config, and browser regression coverage and updated the API, privacy, setup,
+  limitations, and decision documentation.
+
+Verification in this session: Python and JavaScript syntax checks, editor diagnostics on the
+changed Python files, `git diff --check`, wheel build, and wheel UI-asset inspection passed.
+Automated tests, browser tests, live Neo4j, and live model/provider checks were not run. Token
+rotation/migration, interrupted-run re-execution, and external identity provider integration remain
+unsupported. The three repository zip archives were already absent from the working tree at the
+start of this work; they were not modified.
+
+## Neo4j durability completion status (2026-10-30)
+
+Added Neo4j uniqueness constraints for `Session.session_id`, `Request.request_id`, and `Result.result_id` alongside the existing `GraphNode.id` constraint. Application writes now create sanitized Request and ExecutionPlan records before/after dispatch and link them to the active Session and Execution.
+
+Offline suite: **378 passed, 1 skipped, 118 deselected**, one deprecation warning. No real Neo4j restart test was run because no verified isolated database configuration was available. Required variables are `NEO4J_URI`, `NEO4J_USER` (or `NEO4J_USERNAME`), `NEO4J_PASSWORD`, and optional `NEO4J_DATABASE`; use `python -m agent_repo.api --use-aura --graph-file <path> --port <port>` only against an explicitly isolated database.
+
+The file/in-memory graph and offline tests do not prove Neo4j durability. Live Ollama and Playwright worker execution remain separate and were not used as Neo4j evidence.
+
+## Manifest integrity compatibility repair (2026-10-30)
+
+Read-only reproduction using agent-graph.json loaded into memory raised RepositoryError at repository.py:165 for image_generator@0.1. The user's running server/backend was not independently observed. No Neo4j connection or application-data write was performed.
+
+Stored hash and SHA-256 of stored canonical JSON both equal `9a26b4ffd27b629b3ad1b24ecff1501b7f4a9a11b9c07714284c33c181dbc198`. Before the fix the loaded manifest hashed to `ecec8a6d2a29773436a663e2e559275069a49a8b52162509fa3ebc6534cca7fb`. The only differing path against the round trip and current seed is `$.output_schema`: absent historically, null today. No provider/model, enum, lifecycle or nested parameter differences were found in this record.
+
+manifest.py now preserves this specific historical omission during canonical serialization while the schema remains null. New manifests retain today's encoding. Non-null schemas change the hash; arbitrary missing defaults are not exempted. Existing raw/canonical equality and checksum checks remain enforced. No data recovery, checksum replacement or approval change was needed.
+
+Actual checks:
+- `python -m pytest -q tests/test_manifest_compatibility.py -p no:cacheprovider`: 12 passed (offline memory). Covers seed round trips, historical defaults, repeat seeding, nested mutation, stored tampering blocked from execution, intentional schema changes and unknown missing defaults.
+- `python -m pytest -q -m "not neo4j" -p no:cacheprovider`: 390 passed, 1 skipped, 118 deselected, one dependency deprecation warning, 22.19 seconds. Aggregate offline counts; not Neo4j evidence.
+- `python -m ruff check agent_repo/manifest.py tests/test_manifest_compatibility.py`: No module named ruff. Same result with `.venv\Scripts\python.exe`; lint not verified.
+- Repeating the original image_generator integrity check now succeeds against unchanged stored content/hash. Live image generation, browser interaction and Neo4j execution not verified.
+
+Restart the API with its existing backend arguments to load the fix. Other records with genuinely mismatched stored JSON/checksums remain blocked pending verified-original recovery.
+
+## Durable session and browser milestone — current verification
+
+Implemented durable session history in the application path:
+
+- Sessions and requests use stable identifiers. Request/execution identity is persisted before
+  dispatch; plans retain pinned immutable versions and selection reasons; executions link to step
+  runs, model invocation metadata, validated results, and external artifact references.
+- API session, execution, and artifact reads are owner-scoped. The browser restores output from the
+  backend and reuses an owner-scoped idempotency record for an exact retry after refresh; it does
+  not store queries, outputs, or API tokens in browser storage.
+- Startup marks unfinished runs interrupted rather than re-running side-effecting tools. Artifact
+  bytes remain outside Neo4j.
+- Added deterministic file-backed Playwright coverage and separate opt-in Neo4j/Ollama suites.
+  The regular Playwright configuration runs only the offline UI spec.
+
+Actual checks:
+
+- `.venv\Scripts\python.exe -m pytest tests\test_api.py -q`: **72 passed**.
+- `.venv\Scripts\python.exe -m pytest -q -m "not neo4j" -p no:cacheprovider`: **404 passed,
+  1 skipped, 120 deselected**. Neo4j-marked tests were deselected.
+- `npx playwright test --config=playwright.config.js`: **10 passed** against the deterministic
+  fixture, including fresh file-backed process reopening.
+- JavaScript syntax checks and `git diff --check` passed.
+- Targeted Pylance diagnostics found no errors in changed Python files; unused-symbol warnings
+  remain. Ruff is unavailable, so lint is **not verified**.
+- Real Neo4j persistence/restart is **blocked/not verified**: no isolated test database was
+  configured. The approved local Ollama browser smoke is **blocked/not verified**: no isolated
+  graph/agent/version was configured. No cloud provider or shared database was called.
+
+See [`final-verification.md`](./final-verification.md) for the UI coverage matrix, exact rerun
+commands, and report/screenshot/trace paths. No files were deleted; repository rules prohibit
+deletion, and pre-existing ZIP deletion markers were preserved.
+
+## Session persistence and browser execution follow-up (2026-11-02)
+
+Milestone 1 follow-up:
+
+- The opt-in isolated Neo4j browser test now submits the same request again with its captured
+  idempotency key and asserts the exact saved response is replayed. Its read-only verifier checks
+  one run-owned session/request/plan/execution/result and stable relationship counts, including
+  step-run links, before and after a fresh application process.
+- The Neo4j fixture requires `AGENT_REPO_TEST_NEO4J_URI`,
+  `AGENT_REPO_TEST_NEO4J_USER`, `AGENT_REPO_TEST_NEO4J_PASSWORD`, and
+  `AGENT_REPO_TEST_NEO4J_DATABASE`; database names must be run-specific and use the
+  `agent_repo_test_` prefix. It refuses a non-empty initial database and performs no wipe.
+- No isolated database was configured, so actual Neo4j restart durability/idempotency remains
+  **blocked/not verified**. The offline persistence-failure test injects an error and is not
+  presented as Neo4j evidence.
+
+Milestone 2 browser follow-up:
+
+- Earlier `spawn EPERM` occurred after test discovery, while Playwright's `ProcessHost.startRunner`
+  forked a test worker via Node `child_process`. `PW_MANUAL_SERVER=1` was active, so the Python
+  webServer child was not involved. The recorded runtime was Node `v24.21.0`, executable
+  `C:\Program Files\nodejs\node.exe`; browser launch had not started. The precise Windows
+  security/ACL cause was not exposed and is not established.
+- Current `npx playwright test --config=playwright.config.js --workers=1` started the configured
+  Python fixture and browser successfully: **10 passed**. EPERM is not reproducible in this run.
+  The one-worker option was diagnostic, not treated as a security bypass.
+- Added a simulated network timeout assertion for visible failure, enabled submit control, and
+  cleared stale output. The first attempt was **9 passed, 1 failed** because the global console
+  guard flagged the deliberately induced `net::ERR_TIMED_OUT`; the test now allows only that exact
+  expected console message. The focused case then passed (**1 passed**) and the full suite passed
+  (**10 passed**).
+- The earlier Versions-tab failure was an incorrect test expectation: the UI's default agent was
+  `audio_transcriber`; the test now explicitly selects `text_summarizer` and retains its positive
+  assertion. No product assertion was weakened.
+- Latest offline Python verification: API **72 passed**; full offline **404 passed, 1 skipped,
+  120 deselected**. `ruff check .` could not run because Ruff is not installed. Live Ollama remains
+  **not verified** because no approved isolated graph/version was configured.
+- Approval, cancel/resume, and version-comparison flows have no corresponding controls/routes in
+  the current read-only API/UI and are explicitly excluded.
+
+See [`final-verification.md`](./final-verification.md) for the coverage matrix, exact PowerShell
+commands (including the manual-fixture fallback), and the list of infrastructure still required.
+
+## Milestone 1 final continuation
+
+Completed the remaining session-history implementation and offline/browser verification:
+
+- Stable session owners now derive from the configured actor name and `AGENT_REPO_HASH_SALT`,
+  not the bearer token. A token rotation retains access when the salt and actor name are kept.
+  Prior token-derived records retain a same-token compatibility lookup; migration after rotating
+  an old token is not guaranteed because the previous identity cannot be reconstructed.
+- Session reads, execution list/detail, artifact access, and request submission check the
+  authenticated owner's stable identity (or the explicit legacy compatibility alias). A
+  client-supplied actor/owner is not accepted as authorization.
+- Request idempotency is scoped by owner and operation. Same-key session creation is replayable;
+  same-key request replay returns the prior response; changed payload/session conflicts, and
+  another owner can independently use the same key.
+- The persisted graph chain now has explicit assertions for Session → Request → Plan → Execution
+  → Result, with StepRun associations. History includes sanitized request text and execution
+  terminal status; the UI presents failed executions as failures without rendering their output
+  as a successful answer.
+- Browser history verification now creates two distinct sessions/requests, switches in both
+  directions, refreshes, and reopens both outputs. Browser coverage also rejects cross-user read
+  and submission attempts.
+- README and API setup docs describe the required stable salt and external artifact references.
+  Temporary upload binaries are not retained; their sanitized metadata and content hash are.
+
+Actual final-code checks:
+
+- `tests\test_api.py`: **73 passed** using a unique writable `%TEMP%`/pytest base directory.
+  The earlier reported temporary-directory setup failures did not recur; no permission tests
+  were disabled and no broad permissions were changed.
+- Offline Python suite: **405 passed, 1 skipped, 120 deselected**. The single skip is the Aura
+  CLI smoke test; all Neo4j-marked tests were deselected.
+- Deterministic Playwright suite: **11 passed** with one worker. An initial run was **10 passed,
+  1 failed** because the new cross-user test correctly received 404 responses that the browser
+  console guard had not yet classified as expected. The test now allows only the expected 404
+  resources; the focused test passed, then the complete suite passed.
+- JavaScript syntax, Python compilation, `git diff --check`, and targeted Pylance diagnostics
+  passed. Ruff is unavailable (`ruff` is not recognized), so lint is **not verified**.
+- Neo4j test configuration and isolated Ollama graph/agent/version variables are absent. No
+  database was contacted or written, and no live Ollama/cloud call was made. Real Neo4j
+  restart/idempotency and live Ollama browser verification remain **blocked/not verified**.
+
+The prior `spawn EPERM` diagnosis remains: Playwright's worker `child_process.fork()` failed
+before browser launch, while manual-server mode was enabled; its exact Windows ACL/policy cause
+was not exposed. The current configured-server run launched both app and browser and passed all
+11 tests, so EPERM was not reproduced.
+
+## Session recovery and interactive UI verification (2026-11-02)
+
+Implemented and verified the remaining UI and graph-contract follow-up:
+
+- The selected session is represented by an opaque `?session=<id>` URL parameter and restored
+  only after the backend returns the authenticated actor's session list. Switching updates the
+  parameter; no query, output, or token is placed in browser storage.
+- Session restore now has explicit loading/empty/error states. A per-submit generation prevents a
+  late success or failure from changing the newly selected session or enabling its active submit
+  button. Retry/idempotency state is cleared only for the matching request, so late results cannot
+  clear another session's key.
+- Added the semantically explicit `Execution-[:USES_PLAN]->ExecutionPlan` edge while preserving
+  existing graph links; offline graph assertions and the opt-in Neo4j verifier check it.
+- The Versions screen now compares metadata for two selected immutable versions. Primary tabs
+  expose tab semantics and support arrow/Home/End keyboard navigation. The UI received a responsive
+  visual refresh, focus states, reduced-motion handling, loading affordances, and an accessible
+  session history/composer.
+- Playwright now covers automatic refresh restore, delayed failure after switching, side-by-side
+  version comparison, invalid output presented as a failure, and duplicate concurrent API request
+  identity. The browser test for invalid output uses a deterministic API response fixture; it is
+  not evidence of provider inference.
+- `playwright.config.js` accepts `PW_BASE_URL`, `PW_MANUAL_SERVER=1`, and a configured
+  `AGENT_REPO_BROWSER_GRAPH_FILE` for a manually started deterministic server.
+
+Fresh results:
+
+- `tests\test_api.py`: **74 passed**.
+- `tests\test_artifacts.py`: **5 passed**.
+- Offline suite: **406 passed, 1 skipped, 120 deselected**. The one skip is the Aura CLI smoke;
+  Neo4j-marked tests were deselected.
+- Playwright: **14 passed** using the configured fixture server and Chromium. The real browser
+  verified request output against the backend response and reopened history from a fresh
+  file-backed process.
+- Changed Python files have no Pylance errors; Python compilation, JavaScript syntax checks, and
+  `git diff --check` passed. Ruff remains **not verified** because it is not installed.
+- The two earlier artifact temp-directory setup errors did not recur: all five artifact tests pass
+  under a fresh unique `%TEMP%`/pytest base. The old traceback is unavailable, so the former root
+  cause is **not established**.
+- `spawn EPERM` did not recur. Earlier evidence attributes it to Playwright's Node worker
+  `child_process.fork()` under Node 24.21.0 before browser launch; its Windows security/ACL cause
+  remains unknown. The latest configured-server run successfully launched the Python webServer
+  and browser.
+- No Neo4j or Ollama test settings were configured. Real Neo4j relationship/restart durability
+  and live Ollama output remain **blocked/not verified**; neither service was contacted.
+
+The UI coverage matrix, artifacts, and copy-ready commands are in
+[`final-verification.md`](./final-verification.md). Setup and manual-server commands are in
+[`UI_API.md`](./UI_API.md).
+
+## Neo4j restart harness and saved-run interaction (2026-11-02)
+
+- Added a session-history **View in workspace** action. It loads the saved request and output
+  into the composer without resubmitting; a failed execution restores its failure state and
+  cannot expose an earlier successful output. The action is scoped to the currently selected
+  session.
+- Corrected the opt-in Neo4j browser harness so it explicitly stops its first application
+  process before starting the second process against the same run-owned database. It now stores
+  two different requests in separate sessions, checks their request text, output, pinned version,
+  ownership and results, reopens both after restart, and compares run-owned node/relationship
+  counts across idempotent replay, history reads and the restarted process.
+- The dedicated Neo4j runner requires
+  `AGENT_REPO_TEST_NEO4J_URI`, `AGENT_REPO_TEST_NEO4J_USER`,
+  `AGENT_REPO_TEST_NEO4J_PASSWORD`, and `AGENT_REPO_TEST_NEO4J_DATABASE`. It refuses a
+  non-empty initial database and never runs a database-wide cleanup. This strengthened real
+  Neo4j test is defined but **not run** because all four variables were unset; real Neo4j
+  persistence and restart durability remain **blocked/not verified**.
+
+Fresh results for this continuation:
+
+- Per-file checks: `tests\test_api.py` **74 passed**; `tests\test_graph_store.py`
+  **10 passed, 6 Neo4j/Aura opt-in skips**; `tests\test_artifacts.py` **5 passed**.
+- Focused API/graph/artifact regressions:
+  `.venv\Scripts\python.exe -m pytest -q tests\test_api.py tests\test_graph_store.py tests\test_artifacts.py --basetemp <unique-temp>`
+  => **89 passed, 6 skipped**, no failures. The six skips require the destructive Aura opt-in;
+  it was not enabled.
+- Full offline suite:
+  `.venv\Scripts\python.exe -m pytest -q -m "not neo4j" --basetemp <unique-temp>`
+  => **406 passed, 1 skipped, 120 deselected**, no failures.
+- Deterministic Playwright:
+  `npx --no-install playwright test --config=playwright.config.js --reporter=list`
+  => **14 passed**, including loading saved successful and failed runs, session switching,
+  file-backed restart recovery, and existing mobile/keyboard/output checks.
+- JavaScript syntax, Python compilation for the Neo4j verifier/server, and `git diff --check`
+  passed. Ruff is unavailable, so lint is **not verified**.
+- The file-backed browser restart is not Neo4j evidence. Real Neo4j restart and live Ollama
+  remain **not verified**. The previously reported Playwright worker `spawn EPERM` did not
+  recur; the actual browser and fixture server launched successfully.
+
+## Offline and live Ollama verification — 2026-11-02
+
+- Fixed `_run` to construct Ollama from the API's injected settings rather than process defaults.
+  Added a regression test covering endpoint, provider timeout, context, prediction limit, and
+  concurrency. Imported `Any` in `agent_repo/artifacts.py` to resolve the real F821 diagnostic.
+- Improved the Ask surface with a subtle radial/line treatment, elevated composer/history cards,
+  hover affordances, and visible focus feedback while retaining the existing responsive layout.
+- Focused API tests: **75 passed**. Artifact tests: **5 passed** with both an explicit unique
+  `%TEMP%` base and pytest's default temp root. The earlier Windows setup errors did not
+  reproduce; their historical traceback is unavailable, so the former root cause is not claimed.
+- Full offline run:
+  `.venv\Scripts\python.exe -m pytest -q -m 'not neo4j' --basetemp $base`
+  => **407 passed, 1 skipped, 120 deselected**, 0 failures, 41.58s. Fake Ollama HTTP tests
+  monkeypatch the network boundary; no Ollama/cloud/Neo4j call occurred in pytest.
+- Ruff:
+  `uv tool run --from ruff ruff check --output-format concise .`
+  => **111 existing findings**. The missing `Any` import is fixed; broad unrelated lint cleanup
+  was not performed. Pylance diagnostics on changed Python files report **0 errors**.
+- Deterministic Playwright: **14 passed**, including session history/reload, retry/idempotency,
+  cross-user denial, output/failure/stale-response behavior, uploads/artifacts, keyboard/mobile,
+  and file-backed restart. The live Ollama browser smoke: **1 passed**.
+- Local qwen3:4b direct, CLI, API, and browser requests all preserved 1984 and 12 galleries.
+  API/browser graph records include `ollama`/`qwen3:4b`, status, tokens, and latency. CLI
+  execution recorded the selected immutable version, token usage, and execution latency.
+  Effective local smoke deadlines were 180 seconds; cloud providers were disabled and no model
+  download was performed.
+- API reads and polling returned the same one-request/one-execution history and did not change
+  the isolated file graph checksum.
+- `spawn EPERM` did not recur. Real Neo4j persistence/restart remains **BLOCKED/not verified**:
+  the isolated `AGENT_REPO_TEST_NEO4J_*` configuration is absent; no Neo4j tests or writes ran.
+- Current reports: `playwright-report/index.html` and
+  `playwright-report-ollama/index.html`; deterministic trace archives are under
+  `test-results/*/trace.zip`. The file-backed restart screenshot and trace are documented in
+  `docs/final-verification.md`.
+
+## 2026-11-03 — Session history restoration and interruption recovery
+
+`GET /sessions/{id}` now returns saved requests, plans/version pins, executions, results, and
+feedback. The UI displays this history after session switches and browser refresh, avoids
+showing saved output bodies for failed/interrupted executions, and lets the authenticated owner
+cancel an interrupted execution. Startup recovery and cancellation update the execution's
+request/step/attempt state through the graph transition operation. JSON graph-fake persistence
+and artifact metadata sidecars were removed; Neo4j remains the application record source of
+truth.
+
+Verification: focused API/graph tests **88 passed, 6 deselected**; full offline suite **392
+passed, 5 skipped, 121 deselected**; deterministic Playwright **14 passed**; Ruff **passed**.
+The actual Neo4j hierarchy query, isolated database restart, and checksum recovery remain
+**unverified** because no dedicated test Neo4j configuration or Docker executable was available.
+No database was queried, modified, wiped, or restarted. Details and exact commands are recorded
+in `docs/final-verification.md`.
+
+## 2026-11-03 — Complete deterministic browser suite
+
+Added two browser-driven cases using test-only fixture endpoints to exercise the existing
+LangGraph plan approval interrupt: pause then approve/resume to a deterministic result, and
+pause then decline without output. This is engine coverage, not a production approval API or UI.
+The complete browser suite ran with the local in-memory fixture, all hosted API keys removed
+from the test process, all media providers set to stubs, and one Playwright worker:
+**16 passed**, with no failures. Session creation/switch/reload, uploads, provider-error display
+without stale/mock-success output, output content, approval pause/resume, decline, and desktop
+/mobile overflow were all included.
+
+`spawn EPERM` was not reproduced. The current workspace path is 66 characters, Node's child
+process spawn check succeeded, the Playwright shim is accessible, and the complete webServer +
+browser-worker run succeeded using `--workers=1`. At check time, Windows Defender realtime
+protection was disabled and two antivirus product records were registered; this does not establish
+whether antivirus caused the earlier failure. The original EPERM root cause remains
+**unverified**. Playwright retained 16 traces; no test failed, so no failure screenshot was
+generated. See `docs/final-verification.md` for the individual test results and command.
+
+## 2026-11-03 — Authorized generated-file cleanup and handoff
+
+Before deletion, the exact ten candidate directories were listed for the user and a
+PowerShell preflight confirmed each was ignored, untracked, present, and not a reparse point.
+Removed only `.pytest_cache/`, `.ruff_cache/`, the five listed `__pycache__/` directories,
+`playwright-report/`, `playwright-report-ollama/`, and `test-results/`; a follow-up check
+confirmed all ten paths absent. The existing `.gitignore` already covers these paths. No
+uncertain files, source, application data, credentials, historical records, virtual
+environments, `node_modules/`, or Neo4j data were removed.
+
+This cleanup/documentation-only milestone did not rerun tests, lint, providers, or Neo4j.
+The session's prior full offline run was **392 passed, 5 skipped, 121 deselected** with
+0 failed/errors; Ruff passed; the complete deterministic Playwright run was **16 passed,
+0 failed**. Exact commands/results and known gaps are recorded in
+`docs/final-verification.md`; the current project status remains **controlled local prototype**.
