@@ -40,21 +40,37 @@ See [`docs/PROJECT_DESCRIPTION.md`](docs/PROJECT_DESCRIPTION.md) for the plain-l
 
 ## Quickstart
 
-### 1. Install (Python 3.12)
+### 1. Install (Python 3.11+)
 
 ```powershell
-python -m venv .venv                                   # create the virtual environment
-.venv\Scripts\python.exe --version                     # 3.12.x
-.venv\Scripts\python.exe -m pip install -e ".[dev]"    # package + test deps
-# Optional live LLM / ASR / vision SDKs (google-genai, groq, langchain-google-genai, langchain-groq, langchain-openai):
-# .venv\Scripts\python.exe -m pip install -e ".[providers]"
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install --no-deps -e .
 ```
 
-The offline demo (step 3) and offline test suite need **no AuraDB, no LLM keys, and no `providers`
-extra — only a non-placeholder `AGENT_REPO_HASH_SALT`** (step 2). `google-genai` and the other
-provider packages (`groq`, `langchain-google-genai`, `langchain-groq`, `langchain-openai`) come from
-the optional `providers` extra (`pip install -e ".[providers]"`). AuraDB is required only for the
-optional Neo4j test tiers.
+`pyproject.toml` is the package metadata and dependency source of truth. `requirements.txt` contains
+only the generated, pinned pip install requirements and hashes for the base package plus all
+`providers`, `ui`, and `dev` extras; it has no explanatory comments or other setup instructions.
+Regenerate it after dependency changes with:
+
+```powershell
+uv pip compile pyproject.toml --all-extras --python-version 3.11 --python-platform windows --generate-hashes --no-emit-index-url --no-annotate --no-header --output-file requirements.txt
+```
+
+The `--no-deps` editable install adds this project without resolving a second, conflicting set of
+dependencies. Offline tests use deterministic, explicitly injected fakes and need no provider key.
+Normal CLI/API startup requires Neo4j. `InMemoryGraph` is a unit-test fake, never an application
+persistence fallback. The `providers` extra installs only the Gemini adapter and its Google Gen AI
+SDK; paid and unverified hosted SDKs are not dependencies.
+
+Non-Python prerequisites: an accessible Neo4j 5 database for normal application startup; Node.js
+and npm for Playwright; and the Playwright Chromium binary for browser execution. Install JavaScript
+dependencies and the browser separately:
+
+```powershell
+npm ci
+npx playwright install chromium
+```
 
 ### 2. Configure `.env`
 
@@ -65,66 +81,67 @@ Copy `.env.example` to `.env` and fill it in. Never commit `.env`.
 # Generate one:  python -c "import secrets; print(secrets.token_hex(16))"
 AGENT_REPO_HASH_SALT=<paste-the-generated-hex-here>
 
-# Neo4j AuraDB Free (the verified graph backend)
+# One configured Neo4j database; use only the intended project/database.
 NEO4J_URI=neo4j+s://<instance-id>.databases.neo4j.io
-NEO4J_USERNAME=neo4j
-NEO4J_PASSWORD=<your-auradb-password>
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=<configured-privately>
 NEO4J_DATABASE=neo4j
+NEO4J_PROJECT_ID=agent-repo
 
-# Optional LLM provider keys (not needed for MockLLM / offline runs)
-# The gemini provider reads GOOGLE_API_KEY (NOT GEMINI_API_KEY).
+# Optional live hosted text inference. Confirm the project's Free Tier and regional eligibility
+# in Google AI Studio first; the application cannot verify billing status.
+LLM_PROVIDER=gemini
+LLM_MODEL=gemini-3.8-flash
+# Change to "free" only after checking the project in Google AI Studio.
+LLM_BILLING_TIER=unverified
+LLM_TIMEOUT_SECONDS=30
+LLM_MAX_RETRIES=1
+LLM_MAX_CONCURRENCY=1
 GOOGLE_API_KEY=
-GROQ_API_KEY=
-OPENAI_API_KEY=
 
-# Optional real tools (default "stub" keeps everything offline/deterministic).
-# AGENT_REPO_TRANSCRIBER: stub | groq   (real ASR via GROQ_API_KEY)
-# AGENT_REPO_IMAGE_CLASSIFIER: stub | gemini  (real vision via GOOGLE_API_KEY)
-# AGENT_REPO_TRANSCRIBER=stub
-# AGENT_REPO_IMAGE_CLASSIFIER=stub
+# Local API authentication (unique random tokens; never commit them).
+AGENT_REPO_API_TOKENS={"alice":"<random-token-at-least-32-characters>"}
+AGENT_REPO_HASH_SALT=<private-random-salt-at-least-16-characters>
 ```
 
-If `NEO4J_URI` is set, the graph backend is AuraDB; otherwise the library falls back to the offline
-`InMemoryGraph`.
+Set `NEO4J_USER` (or its supported legacy alias `NEO4J_USERNAME`), `NEO4J_PASSWORD`,
+`NEO4J_DATABASE`, and `NEO4J_URI`. The project creates/uses a single project-scoped hierarchy in
+that database. It does not silently select a local file or in-memory persistence backend.
 
 `Settings` **refuses a salt that starts with `change-me`** (the `.env.example` placeholder), so a
 copy-paste of the template without editing fails fast instead of hashing with a known value.
 
-### 3. Run the offline demo (no AuraDB, no API keys)
+### 3. Start the API and UI
 
 ```powershell
-.venv\Scripts\python.exe -m agent_repo --graph-file .\agent-graph.json demo
+.\.venv\Scripts\python.exe -m agent_repo.api --port 8000
 ```
 
-`--graph-file` forces the JSON-persisted in-memory graph, so the demo never touches AuraDB. Use a
-fresh path for a clean run (the demo writes examples and a candidate workflow into the graph).
+The local service binds only to `127.0.0.1`. It refuses startup if Neo4j or API actor tokens are not
+configured. Session, request, plan, execution, result, and artifact-reference history is stored in
+Neo4j; there is no JSON-file or SQLite persistence fallback.
 
 ### 4. Use the library
 
 ```python
-from agent_repo.config import Settings
+# InMemoryGraph is for explicit unit-test fixtures, not normal application startup.
 from agent_repo.graph.store import InMemoryGraph
+from agent_repo.execution.runner import Runner
 from agent_repo.repository import AgentRepository
 from agent_repo.seeds import seed_repository
 from agent_repo.tools import builtin_registry
-from agent_repo.execution.runner import Runner
-from agent_repo.execution.engines import LangGraphEngine
 
-settings = Settings.from_env()
-repo = AgentRepository(InMemoryGraph(), tools=builtin_registry())
-seed_repository(repo, "alice")
-engine = LangGraphEngine(Runner(repo))
-
-result = engine.run(query="summarize this text: Sentence one. Sentence two. Sentence three.")
-print(result.status, result.output)
+repo = AgentRepository(InMemoryGraph(), builtin_registry())
+seed_repository(repo, "Test Maintainer")
+result = Runner(repo).execute_query("summarize the key points of this report: Alpha. Beta.")
 ```
 
 ---
 
 ## Command-line interface
 
-`agent-repo` (equivalently `python -m agent_repo`) uses `argparse`. Put the global `--graph-file`
-before or after the subcommand.
+`agent-repo` (equivalently `python -m agent_repo`) uses `argparse` and requires the configured
+Neo4j database for application persistence.
 
 | Command | What it does |
 | --- | --- |
@@ -147,101 +164,49 @@ before or after the subcommand.
 
 ## Run the API
 
-An optional **local, read-mostly** JSON FastAPI service over the same repository, router and runner
-the CLI uses. See [`docs/UI_API.md`](docs/UI_API.md) for the design. It is a thin shell: read-only
-except `POST /ask`, which runs a query through the real router/executor. The core package still
-imports with none of these dependencies installed; the `ui` extra carries them.
+The local FastAPI service uses the same Neo4j-backed repository, router, and runner as the CLI.
+The root `requirements.txt` includes the UI dependencies; after installing it and the project
+editable, configure Neo4j and actor-specific API tokens in `.env`, then run:
 
 ```powershell
-pip install -e ".[ui]"
-python -m agent_repo.api --graph-file .\agent-graph.json
+.\.venv\Scripts\python.exe -m agent_repo.api --port 8000
 ```
 
-The graph target is chosen at startup by CLI argument only, **never per request**. The default is a
-graph file (`.\agent-graph.json`); Aura is used **only** with an explicit `--use-aura` flag (which
-requires `NEO4J_URI`), so the API can never write to Aura by accident. `GET /health` reports the
-active target (`file <path>`, `Aura`, or `in-memory`) without credentials.
+The server binds to `127.0.0.1`, requires `AGENT_REPO_API_TOKENS` and
+`AGENT_REPO_HASH_SALT`, and refuses to start without `NEO4J_URI`, `NEO4J_USER`,
+`NEO4J_PASSWORD`, and `NEO4J_DATABASE`. `InMemoryGraph` is used only by explicit tests. No graph
+file, SQLite, or memory fallback is available in normal application startup.
 
-Endpoints: `GET /health`, `GET /agents`, `GET /agents/{name}`, `GET /agents/{name}/versions`,
-`GET /executions?limit=`, `GET /executions/{id}` (same content as CLI `explain`), `GET /proposals`
-(read-only), and `POST /ask` (multipart `query` + optional `attachment`). There are deliberately
-**no** approve/reject/rollback/feedback/delete routes — a test asserts the exact route set so a
-write endpoint cannot be added by accident. FastAPI's `/docs` page is available for manual checking.
-
-Security: binds to `127.0.0.1` only (refuses any other host with a clear message), no CORS by
-default, every string scrubbed with the CLI's `_safe_text`, sanitized errors (no stack traces),
-uploads capped at 1 MB (configurable, 413 over cap) written to generated temp names and deleted
-after the run, and `/ask` serialized with a lock.
-
-Plan steps come from the same stored plan the CLI prints, through one shared formatter; a value the
-plan did not record is returned as `null` (rendered "not recorded") rather than an invented default
-— covered by a reused-workflow test.
-
-Typed output: `/ask` and `/executions/{id}` return `output` as `{kind: "text"|"json"|"image",
-text?, mime?, data_base64?}`. An image goal returns `kind="image"` with its mime (the stub SVG is
-`image/svg+xml`) and base64 data, capped (default 2 MB; over the cap a text message is returned
-instead). Image bytes are **never stored in the graph** — the execution record keeps only the
-scrubbed `output_text` — so `/executions/{id}` can only surface `kind="text"`. Untrusted markup
-(including an SVG containing `<script>`) is returned as opaque base64 data and never inlined into
-any HTML the API serves; the `image_generate` stub XML-escapes the prompt it embeds.
-
-Limitations: local only, no authentication, read-only except `POST /ask`. Verified live this
-session on `127.0.0.1` against the default graph file:
-
-```
-GET  /health  -> {"status":"ok","target":"file agent-graph.json"}
-GET  /agents  -> 7 rows (audio_transcriber, email_sender, file_analyzer, image_classifier,
-                         image_generator, meeting_note_taker, text_summarizer)
-POST /ask "summarize the key points of this report: Alpha facts. Beta launch."
-              -> status=succeeded kind=text goal=text_summarizer@0.2 steps=1 (step score=1.0)
-POST /ask "generate an image of a cat"
-              -> status=succeeded kind=image mime=image/svg+xml (base64 data, length 244)
-```
-
-Binding to `0.0.0.0` is refused with exit code 2.
+The browser uses bearer-token auth and keeps the token only in memory. Session ownership derives
+from the configured actor name and stable salt. Session switching, saved execution recovery,
+idempotency, uploads, owner-scoped artifact reads, and sanitized failures are covered in
+[`docs/UI_API.md`](docs/UI_API.md). Live model use is governed by the free-only Gemini policy in
+[`docs/LLM_PROVIDERS.md`](docs/LLM_PROVIDERS.md).
 
 ---
 ## Tests
 
-Run the fast suite (no Neo4j, ~22 s):
-
-    pytest -q -m "not neo4j"
-    # 378 passed, 1 skipped, 118 deselected
-
-Run the full dual-backend suite (requires `NEO4J_TEST_WIPE=1` against a
-**throwaway** Neo4j instance, not the shared AuraDB):
-
-    pytest -q
-    # 474 passed, 1 skipped  (475 collected)
-
-118 tests are marked `neo4j` and run the same logic against the Neo4j Aura
-backend; 357 run against the in-memory backend only.
-
-> **Tiers 2 and 3 DELETE ALL DATA in the configured AuraDB** — the fixture wipes the database before
-> each test — and require `NEO4J_TEST_WIPE=1` in the shell. **Never point them at a database you
-> care about.** Tier 1 only uses the in-memory backend and deletes nothing.
+Run the offline suite and lint (Neo4j-marked tests and live provider calls are excluded):
 
 ```powershell
-# 1. Offline memory-only tier — no AuraDB, no wipe. ~10 s.
-#    475 tests collected · 474 passed · 1 skipped (fast run without Neo4j: 378 passed, 118 deselected)
-.venv\Scripts\python.exe -m pytest -m "not neo4j"
+.\.venv\Scripts\python.exe -m pytest -q -m "not neo4j"
+.\.venv\Scripts\python.exe -m ruff check .
 
-# 2. AuraDB smoke tier — DELETES ALL DATA in the configured AuraDB before each test.
-#    Collected (--collect-only -q -m neo4j_smoke): 42 smoke tests across both backends.
-#    Pass/fail count: not verified in this session (requires a live wipe).
-$env:NEO4J_TEST_WIPE="1"; .venv\Scripts\python.exe -m pytest -m neo4j_smoke -v
-
-# 3. Full dual-backend tier — DELETES ALL DATA in the configured AuraDB before each test. ~13 min.
-#    Full dual-backend run on 2026-10-20: 355 passed, 1 skipped in 15 min 03 s (356 collected),
-#    against Aura.
-$env:NEO4J_TEST_WIPE="1"; .venv\Scripts\python.exe -m pytest -q
+npx --no-install playwright test --config=playwright.config.js --workers=1 --reporter=list
 ```
 
-`NEO4J_TEST_WIPE` is read **only from the shell** for a single run — never from `.env` — and the
-fixture **prints the target host before wiping it**: `tests/conftest.py:87` (inside
-`wipe_neo4j_for_tests`). The single skip is
-`tests/test_cli.py::test_cli_agents_command_on_aura_graph[memory]` (an Aura CLI smoke test that is
-meaningful only against Neo4j).
+There is no configured Python static type checker in this project. The Playwright suite uses
+`package.json` and `package-lock.json`; it is not installed through `requirements.txt`.
+The deterministic Playwright fixture injects `InMemoryGraph` and proves UI/session behavior only;
+its refresh checks do not prove application-process or Neo4j restart durability. Real Neo4j
+integration tests are opt-in and must only be run with a verified isolated test database. See
+[`docs/final-verification.md`](docs/final-verification.md) for current evidence and blockers.
+
+Legacy dual-backend pytest markers may write to or wipe the configured Neo4j database. Do not run
+those tests against a shared or application database. The isolated session-history verification
+is a separate opt-in browser suite and requires a fresh, explicitly configured test database;
+see [`docs/final-verification.md`](docs/final-verification.md). Neo4j verification was not run in
+the latest offline test session.
 
 ---
 
@@ -270,7 +235,7 @@ docs/                  # M6 documentation (below)
 tests/                 # full test suite (see Tests)
 deploy/optional/       # unverified optional docker-compose (see limitations)
 ```
-  
+
 ---
 
 ## How to explain this project (plain language)
@@ -302,40 +267,36 @@ an agent's first version, change I/O modalities, add an unknown or HIGH-risk too
 a sub-agent), create a `stable` version, or reach a HIGH-risk tool without an explicit authority
 grant — every one of these is enforced in code, not just in the prompt.
 
-**Honest limits.** The router is measured at 14/20 and 16/20 on two hand-written paraphrase sets that
-are now *development* sets (not unseen benchmarks), and some near-ties route silently to the wrong
-agent ([`docs/ROUTING_EVAL.md`](docs/ROUTING_EVAL.md)). `image_generate` and `email_send` are stubs;
-only `MockLLM` runs in the tests and demo; `openai` is unverified (no credits); and the optional
-`deploy/optional/docker-compose.yml` has never been run. Privacy scrubbing is regex-based (it misses
-names/addresses), and "human approver" is a naming convention, not authentication.
+**Honest limits.** The router is measured at 14/20 and 16/20 on two hand-written paraphrase sets
+that are development sets, not unseen benchmarks; near-ties can route incorrectly
+([`docs/ROUTING_EVAL.md`](docs/ROUTING_EVAL.md)). Hosted inference is allowlisted to
+`gemini:gemini-3.8-flash` only; no live request has been made for this migration. The unpaid Gemini
+terms allow human review and product-improvement use of submitted content, so do not submit
+sensitive data. The UI warns that uploaded files, including PDFs or their extracted text, may be
+sent to Gemini. `LLM_BILLING_TIER=free` is a required operator assertion for dispatch, not an
+automated account-billing check; known paid-tier environment indicators block dispatch. Audio
+transcription and image generation are unavailable; email sending remains a stub. Privacy scrubbing
+is regex-based and does not catch all personal data. A human approver name is a governance
+convention, not authentication.
 
 ---
 
 ## Honest status and limitations
 
-1. **Backends.** **Neo4j AuraDB Free is the verified cloud backend** (full dual-backend run on
-   **2026-10-20**: **355 passed, 1 skipped in 15 min 03 s** (356 collected), against Aura).
-   `InMemoryGraph`
-   is the verified offline backend and is JSON-persistable. `deploy/optional/docker-compose.yml` is an
-   **optional, unverified** local alternative; it has not been run and must not be described as
-   verified.
-2. **LLM providers.** The **`MockLLM` remains the only LLM path exercised by this project's tests
-   and demo** (deterministic, labelled `MOCK LLM` / `"mock"`). The live `LangChainLLM` path has now
-   been verified: **`gemini` (via `gemini-3.5-flash`) and `groq` (via `openai/gpt-oss-20b`) answered a
-   real request**, and **`openai` is *not verified*** — the account has no credits (HTTP 429
-   `insufficient_quota`). Installing the pinned adapters (`pip install -e ".[providers]"`) is required
-   for live calls. Structured content blocks (Gemini 3.x) are normalised to plain text via
-   `extract_text()`, re-verified live (see [`docs/LLM_PROVIDERS.md`](docs/LLM_PROVIDERS.md)). Every
-   non-listed model/provider is **not verified**.
-3. **Tools.** `text_summarize` and `file_analyze` are real deterministic implementations.
-   `audio_transcribe` and `image_classify` have **opt-in real implementations** — Groq
-   (`whisper-large-v3`) and Gemini vision respectively — selected per tool via
-   `AGENT_REPO_TRANSCRIBER=groq` / `AGENT_REPO_IMAGE_CLASSIFIER=gemini`; **both were verified live**
-   (see [`docs/TOOL_INTEGRATIONS.md`](docs/TOOL_INTEGRATIONS.md)). They default to **deterministic
-   offline STUBs** (outputs prefixed `[STUB …]`, `stub: true`), so the automated tests and demo stay
-   offline. `image_generate` and `email_send` are **still stubs only** (no real implementation). The
-   swap point is the "TOOL IMPLEMENTATIONS" section of [`agent_repo/tools.py`](agent_repo/tools.py);
-   a real tool's output is never labelled `stub`.
+1. **Persistence.** Neo4j is the only application datastore. `InMemoryGraph` is an explicit test
+   fake and is not selected by normal CLI/API startup. Prior AuraDB and file-backed verification
+   counts in this document's linked evidence are historical; they do not prove this migration's
+   Neo4j hierarchy or restart behavior. Current Neo4j tests were not run unless listed in
+   [`docs/final-verification.md`](docs/final-verification.md).
+2. **LLM providers.** `gemini:gemini-3.8-flash` is the sole allowlisted hosted pair; the provider
+   factory rejects paid, unknown, and retired providers. `MockLLM` is explicitly injected only for
+   offline tests. Live Gemini remains **not verified** until an operator verifies that the Google
+   project is on the no-billing Free Tier and eligible in the applicable region. Free-tier terms,
+   rate limits, and sources are in [`docs/LLM_PROVIDERS.md`](docs/LLM_PROVIDERS.md).
+3. **Tools.** `text_summarize` and `file_analyze` are deterministic. `image_classify` can be
+   explicitly enabled with Gemini vision; audio transcription and image generation are unsupported
+   stubs, and `email_send` does not send. Earlier Groq and Gemini 3.5 tool calls are historical, not
+   active integrations; see [`docs/TOOL_INTEGRATIONS.md`](docs/TOOL_INTEGRATIONS.md).
 4. **Human approver = naming convention, not authentication.** `is_human_name()` rejects empty
    names and names starting with `llm`/`system` (case-insensitive). It does not authenticate anyone.
 5. **Privacy scrubbing is regex-based.** It catches well-formed secrets/cards/emails/phones/IDs, but
@@ -363,11 +324,11 @@ names are the base names; graph-parametrised tests also run as `[memory]` and `[
 | §2 Python 3.11+/pydantic v2/pytest | `pyproject.toml` | whole suite |
 | §2 LangGraph control flow + LangChain model access | `execution/engines.py`, `llm.py` | `test_plain_engine_and_langgraph_engine_give_identical_results`, `test_mock_llm_and_make_llm_factory`, `test_langchain_adapter_and_factory_errors`, `test_langgraph_mermaid_diagram_has_all_nodes` |
 | §2 Neo4j 5 driver; optional docker-compose | `graph/neo4j_store.py`, `deploy/optional/docker-compose.yml` | `test_cli_agents_command_on_aura_graph` (`[neo4j]`); **docker-compose not verified** |
-| §2 `LLMProvider` + offline `MockLLM` | `llm.py` | `test_mock_llm_and_make_llm_factory`, `test_langchain_adapter_and_factory_errors`; live `gemini`/`groq` verified manually in [`docs/LLM_PROVIDERS.md`](docs/LLM_PROVIDERS.md) (`openai` not verified) |
+| §2 free-only `LLMProvider` + offline `MockLLM` | `llm.py`, `config.py` | `test_mock_llm_and_make_llm_factory`, `test_free_model_configuration_and_exact_factory_dispatch`, `test_provider_failures_are_normalized`; live Gemini not verified |
 | §2 no secrets in code; `.env` (`.env.example`) | `.env.example`, `config.py` | `test_env_overrides_file`, `test_settings_reject_change_me_placeholder_salt` |
-| §2 `InMemoryGraph` (JSON) behind `GraphStore`; guarded dual-backend wipes | `graph/store.py`, `tests/conftest.py` | `test_json_roundtrip`, `test_crud_and_rel_queries`; every `graph`-parametrised test runs on both backends |
+| §2 Neo4j application persistence; explicit in-memory test fake | `graph/neo4j_store.py`, `graph/store.py` | Neo4j-specific checks require verified isolated DB configuration; do not infer durability from in-memory tests |
 | §2 stub tools clearly labelled | `tools.py` | `test_stubs_are_labelled`, `test_stub_outputs_are_deterministic` |
-| §2 opt-in real tools (Groq ASR, Gemini vision) | `tools.py`, `config.py` | `test_default_registry_uses_stubs`, `test_registry_selects_real_providers`, `test_unknown_tool_provider_is_rejected`, `test_audio_transcribe_groq_returns_transcript`, `test_image_classify_gemini_parses_and_truncates_labels` plus the rest of `tests/test_real_tools.py`; live run in [`docs/TOOL_INTEGRATIONS.md`](docs/TOOL_INTEGRATIONS.md) |
+| §2 tool capability policy | `tools.py`, `config.py` | `test_audio_and_image_generation_are_explicitly_non_live_stubs`, `test_image_classifier_uses_the_allowlisted_free_gemini_vision_model`; fake responses only |
 | §3 manifest fields + validation | `manifest.py` | `test_valid_manifest`, `test_required_fields`, `test_needs_pipeline_or_prompt`, `test_sub_agent_must_pin_version`, `test_unknown_fields_rejected`, `test_manifest_is_frozen` |
 | §3 `describe()` incl. tools via sub-agents + catalog | `repository.py`, `seeds.py` | `test_describe_has_every_manifest_field`, `test_composite_reports_tools_via_sub_agents`, `test_transitive_high_risk_detection`, `test_catalog_lists_all_agents_and_stubs` |
 | §4 graph nodes/rels, JSON payloads, `execution_subgraph` + renderer | `graph/store.py`, `graph/views.py` | `test_schema_is_enforced`, `test_graph_edges_for_tools_and_sub_agents`, `test_workflow_memory_reuse_and_execution_subgraph` |
@@ -428,3 +389,36 @@ names are the base names; graph-parametrised tests also run as `[memory]` and `[
 - [docs/UI_API.md](docs/UI_API.md) — local read-mostly FastAPI service: endpoints, security rules, typed output.
 - [docs/SPEC.md](docs/SPEC.md) — original requirements (reference only).
 
+## Durable sessions and browser verification
+
+Sessions, requests, plans, executions, step runs, results, model metadata, and artifact references
+are persisted to Neo4j; large artifact bytes stay outside the graph. The browser keeps the bearer
+token in memory and does not use browser storage for history or request content. The deterministic
+browser fixture uses an in-memory graph and is not restart-durability evidence. Real Neo4j
+verification must use a dedicated, verified isolated database named
+`agent_repo_test_<unique suffix>`.
+
+On startup, prior `pending`/`running` executions are marked `interrupted` without being
+redispatched. Their session history remains inspectable; the authenticated owner can cancel an
+interrupted execution. Session restoration returns saved requests, plans/version pins, executions,
+results, and feedback. The API/browser refresh tests use a test graph fake and do not prove a
+Neo4j/container restart; that remains unverified until the isolated test target is available.
+
+```powershell
+# Start the API/UI using the configured Neo4j database.
+.\.venv\Scripts\python.exe -m agent_repo.api --port 8765
+
+# Full offline Python regression suite (no Neo4j writes or live providers).
+.\.venv\Scripts\python.exe -m pytest -q -m "not neo4j"
+
+# Deterministic Playwright suite; starts its in-memory test fixture.
+npx --no-install playwright test --config=playwright.config.js --workers=1
+```
+
+The HTML report is `playwright-report/index.html`; screenshots and traces are under
+`test-results/`. Real Neo4j and provider verification prerequisites, coverage limits, and current
+evidence are documented in [`docs/UI_API.md`](docs/UI_API.md) and
+[`docs/final-verification.md`](docs/final-verification.md). In-memory browser refresh tests do not
+count as proof of Neo4j durability.
+#   A g e n t - A u t o n o m o u s - O r c h e s t r a t o r  
+ 
